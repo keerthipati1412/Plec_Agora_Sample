@@ -1,3 +1,34 @@
+let doctorMqttClient = null;
+let doctorControlTopic = "";
+
+function connectDoctorMQTT(appId, channel) {
+  const cleanAppId = appId.substring(0, 8);
+  doctorControlTopic = `${channel}-control-${cleanAppId}`;
+  console.log(`Connecting to MQTT Broker for doctor on topic: ${doctorControlTopic}`);
+
+  try {
+    doctorMqttClient = mqtt.connect("wss://broker.hivemq.com:8000/mqtt");
+    
+    doctorMqttClient.on("connect", () => {
+      console.log("Doctor connected to MQTT Broker");
+    });
+    
+    doctorMqttClient.on("error", (err) => {
+      console.error("Doctor MQTT Connection error:", err);
+    });
+  } catch (e) {
+    console.error("Failed to connect to MQTT broker for doctor:", e);
+  }
+}
+
+function sendControlCommand(name, value) {
+  if (roleInput.value === "doctor" && doctorMqttClient && doctorMqttClient.connected) {
+    const payload = JSON.stringify({ control: name, value: value });
+    doctorMqttClient.publish(doctorControlTopic, payload);
+    console.log(`Published control: ${name} = ${value} to ${doctorControlTopic}`);
+  }
+}
+
 const appIdInput = document.getElementById("appId");
 const channelInput = document.getElementById("channel");
 const tokenInput = document.getElementById("token");
@@ -989,6 +1020,10 @@ async function joinCall() {
     return;
   }
 
+  if (role === "doctor") {
+    connectDoctorMQTT(appId, channel);
+  }
+
   joinBtn.disabled = true;
 
   try {
@@ -1309,6 +1344,12 @@ async function leaveCall() {
   muteBtn.disabled = true;
   localCameraBtn.disabled = true;
   localMicBtn.disabled = true;
+
+  if (doctorMqttClient) {
+    console.log("Disconnecting doctor MQTT client...");
+    doctorMqttClient.end();
+    doctorMqttClient = null;
+  }
 
   // Hide and stop self-view mirror
   if (floatingSelfView) {
@@ -1648,6 +1689,7 @@ if (controlStartBtn && controlFreezeBtn && controlStatusLabel) {
     controlFreezeBtn.classList.remove("active");
     controlStatusLabel.textContent = "RUNNING";
     controlStatusLabel.className = "status-val running";
+    sendControlCommand("start", true);
   });
 
   controlFreezeBtn.addEventListener("click", () => {
@@ -1655,6 +1697,7 @@ if (controlStartBtn && controlFreezeBtn && controlStatusLabel) {
     controlStartBtn.classList.remove("active");
     controlStatusLabel.textContent = "STOPPED";
     controlStatusLabel.className = "status-val stopped";
+    sendControlCommand("freeze", true);
   });
 }
 
@@ -1683,6 +1726,10 @@ if (voltageSlider && voltageValueInput) {
     updateSliderBackground(voltageSlider);
   });
 
+  voltageSlider.addEventListener("change", () => {
+    sendControlCommand("voltage", voltageSlider.value);
+  });
+
   // Initial fill update
   updateSliderBackground(voltageSlider);
 }
@@ -1693,6 +1740,7 @@ if (voltageMinus && voltageSlider) {
     if (val > parseInt(voltageSlider.min, 10)) {
       voltageSlider.value = val - 1;
       voltageSlider.dispatchEvent(new Event("input"));
+      voltageSlider.dispatchEvent(new Event("change"));
     }
   });
 }
@@ -1703,6 +1751,7 @@ if (voltagePlus && voltageSlider) {
     if (val < parseInt(voltageSlider.max, 10)) {
       voltageSlider.value = val + 1;
       voltageSlider.dispatchEvent(new Event("input"));
+      voltageSlider.dispatchEvent(new Event("change"));
     }
   });
 }
@@ -1719,6 +1768,10 @@ if (gainSlider && gainValueInput) {
     updateSliderBackground(gainSlider);
   });
 
+  gainSlider.addEventListener("change", () => {
+    sendControlCommand("gain", gainSlider.value);
+  });
+
   updateSliderBackground(gainSlider);
 }
 
@@ -1728,6 +1781,7 @@ if (gainMinus && gainSlider) {
     if (val > parseInt(gainSlider.min, 10)) {
       gainSlider.value = val - 1;
       gainSlider.dispatchEvent(new Event("input"));
+      gainSlider.dispatchEvent(new Event("change"));
     }
   });
 }
@@ -1738,6 +1792,7 @@ if (gainPlus && gainSlider) {
     if (val < parseInt(gainSlider.max, 10)) {
       gainSlider.value = val + 1;
       gainSlider.dispatchEvent(new Event("input"));
+      gainSlider.dispatchEvent(new Event("change"));
     }
   });
 }
@@ -1756,6 +1811,7 @@ if (tgcToggle && tgcSlidersContainer) {
       tgcSlidersContainer.classList.add("disabled");
       sliders.forEach(s => s.disabled = true);
     }
+    sendControlCommand("tgc_toggle", tgcToggle.checked);
   });
 }
 
@@ -1768,9 +1824,20 @@ for (let i = 1; i <= 6; i++) {
       label.textContent = slider.value;
       updateSliderBackground(slider);
     });
+    slider.addEventListener("change", () => {
+      sendControlCommand(`tgc_slider_${i}`, slider.value);
+    });
     // Initial fill update
     updateSliderBackground(slider);
   }
+}
+
+// Display Toggle Interaction
+const displayToggle = document.getElementById("displayToggle");
+if (displayToggle) {
+  displayToggle.addEventListener("change", () => {
+    sendControlCommand("display", displayToggle.checked);
+  });
 }
 
 // Save Setup & Advanced buttons action
@@ -1780,12 +1847,14 @@ const advancedBtn = document.getElementById("advancedBtn");
 if (saveSetupBtn) {
   saveSetupBtn.addEventListener("click", () => {
     alert("OpenSonics Control Setup Saved successfully!");
+    sendControlCommand("save_setup", true);
   });
 }
 
 if (advancedBtn) {
   advancedBtn.addEventListener("click", () => {
     alert("Opening Advanced Controls parameters dialog...");
+    sendControlCommand("advanced", true);
   });
 }
 
