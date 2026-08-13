@@ -1,32 +1,59 @@
 let doctorMqttClient = null;
 let doctorControlTopic = "";
+let pendingMqttPayloads = [];
 
 function connectDoctorMQTT(appId, channel) {
-  const cleanAppId = appId.substring(0, 8);
-  doctorControlTopic = `${channel}-control-${cleanAppId}`;
-  console.log(`Connecting to MQTT Broker for doctor on topic: ${doctorControlTopic}`);
+  const targetAppId = appId || (document.getElementById("appId") ? document.getElementById("appId").value.trim() : "");
+  const targetChannel = channel || (document.getElementById("channel") ? document.getElementById("channel").value.trim() : "torus");
+  
+  if (!targetAppId) {
+    console.warn("[Doctor MQTT] App ID is missing, skipping MQTT connection.");
+    return;
+  }
+
+  const cleanAppId = targetAppId.substring(0, 8);
+  doctorControlTopic = `${targetChannel}-control-${cleanAppId}`;
+  console.log(`[Doctor MQTT] Connecting to MQTT Broker on topic: ${doctorControlTopic}`);
+
+  if (doctorMqttClient && (doctorMqttClient.connected || doctorMqttClient.reconnecting)) {
+    return;
+  }
 
   try {
     doctorMqttClient = mqtt.connect("wss://broker.hivemq.com:8000/mqtt");
     
     doctorMqttClient.on("connect", () => {
-      console.log("Doctor connected to MQTT Broker");
+      console.log(`[Doctor MQTT] Connected to broker. Topic: ${doctorControlTopic}`);
+      // Flush any queued payloads
+      while (pendingMqttPayloads.length > 0) {
+        const payload = pendingMqttPayloads.shift();
+        doctorMqttClient.publish(doctorControlTopic, payload);
+        console.log(`[Doctor MQTT] Flushed queued control to ${doctorControlTopic}:`, payload);
+      }
     });
     
     doctorMqttClient.on("error", (err) => {
-      console.error("Doctor MQTT Connection error:", err);
+      console.error("[Doctor MQTT] Connection error:", err);
     });
   } catch (e) {
-    console.error("Failed to connect to MQTT broker for doctor:", e);
+    console.error("[Doctor MQTT] Failed to instantiate connection:", e);
   }
 }
 
 function sendControlCommand(name, value) {
-  if (roleInput.value === "doctor" && doctorMqttClient && doctorMqttClient.connected) {
-    const payload = JSON.stringify({ control: name, value: value });
-    doctorMqttClient.publish(doctorControlTopic, payload);
-    console.log(`Published control: ${name} = ${value} to ${doctorControlTopic}`);
+  if (roleInput.value !== "doctor") return;
+
+  const payload = JSON.stringify({ control: name, value: value });
+
+  if (!doctorMqttClient || !doctorMqttClient.connected) {
+    console.log(`[Doctor MQTT] Not connected yet. Initiating connection and queuing: ${name} = ${value}`);
+    pendingMqttPayloads.push(payload);
+    connectDoctorMQTT();
+    return;
   }
+
+  doctorMqttClient.publish(doctorControlTopic, payload);
+  console.log(`[Doctor MQTT] Published control: ${name} = ${value} to ${doctorControlTopic}`);
 }
 
 const appIdInput = document.getElementById("appId");
@@ -1525,6 +1552,7 @@ function openControls() {
     console.warn("Unauthorized access attempt to Controls.");
     return;
   }
+  connectDoctorMQTT();
   controlsModal.classList.add("active");
   const modalContent = controlsModal.querySelector(".controls-modal-content");
   if (modalContent) {
