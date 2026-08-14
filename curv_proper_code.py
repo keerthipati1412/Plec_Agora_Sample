@@ -1,7 +1,6 @@
 from scipy.signal import firwin
 import numpy as np
 import math
-import threading
 
 import ostb._ostb as ostb
 
@@ -155,7 +154,7 @@ polar_image_grid = (
 polar_bounds = polar_image_grid.bounds
 display_x_coordinates = np.linspace(
     float(polar_bounds.x_limits[0]),
-    float(polar_bounds.x_limits[1]),
+    float(polar_bounds.z_limits[0]),
     512,
 )
 display_z_coordinates = np.linspace(
@@ -287,97 +286,18 @@ print("Writing Hardware Configuration...", end="")
 runtime.configure(configuration)
 print(" OK")
 
-''' --- Explicit Control Functions --- '''
+runtime.start_control_server()
+runtime.run_controller()
 
-def start_acquisition() -> bool:
-    """Starts ultrasound hardware scan directly via OSTB runtime."""
-    print("[curv_proper_code] Executing start_acquisition()")
-    try:
-        if hasattr(runtime, 'start'):
-            runtime.start()
-            return True
-    except Exception as e:
-        print(f"[curv_proper_code] Error starting acquisition: {e}")
-    return False
+print("Saving Acquired Data...", end="")
+ostb.save_acquisition_archive_hdf5(
+    configuration,
+    "capture_focused_curvilinear.h5",
+    include_rf_data=True,
+    include_process_output_data=True,
+)
+print(" OK")
 
-
-def stop_acquisition() -> bool:
-    """Stops/Freezes ultrasound hardware scan directly via OSTB runtime."""
-    print("[curv_proper_code] Executing stop_acquisition()")
-    try:
-        if hasattr(runtime, 'stop'):
-            runtime.stop()
-            return True
-    except Exception as e:
-        print(f"[curv_proper_code] Error stopping acquisition: {e}")
-    return False
-
-
-def set_voltage(val: float) -> bool:
-    """Sets negative voltage on waveform and updates runtime configuration."""
-    print(f"[curv_proper_code] Executing set_voltage({val})")
-    try:
-        v = max(0.0, min(50.0, float(val)))
-        waveform.set_negative_voltage(v)
-        runtime.configure(configuration)
-        return True
-    except Exception as e:
-        print(f"[curv_proper_code] Error setting voltage: {e}")
-    return False
-
-
-def set_gain(val: float) -> bool:
-    """Sets analog gain and updates runtime configuration."""
-    print(f"[curv_proper_code] Executing set_gain({val})")
-    try:
-        global gain_analog_db
-        gain_analog_db = max(0.0, min(40.0, float(val)))
-        runtime.configure(configuration)
-        return True
-    except Exception as e:
-        print(f"[curv_proper_code] Error setting gain: {e}")
-    return False
-
-
-def set_display(enabled: bool) -> bool:
-    """Toggles display rendering in acquisition processing configuration."""
-    print(f"[curv_proper_code] Executing set_display({enabled})")
-    try:
-        processing.set_enable_display(bool(enabled))
-        runtime.configure(configuration)
-        return True
-    except Exception as e:
-        print(f"[curv_proper_code] Error setting display: {e}")
-    return False
-
-
-def get_current_status() -> dict:
-    """
-    Returns current control panel state based directly on curv_proper_code.py parameters.
-    Used by Doctor control panel on page load to read initial values.
-    """
-    return {
-        "status": "RUNNING" if getattr(runtime, 'is_running', False) else "STOPPED",
-        "voltage": float(getattr(waveform, 'negative_voltage', 50.0)),
-        "gain": float(gain_analog_db),
-        "display": bool(getattr(processing, 'enable_display', True)),
-        "tgc_enabled": False,
-        "tgc_sliders": [50, 12, 3, 77, 90, 30]
-    }
-
-
-def run_gui() -> None:
-    """Runs the OpenSonics NEXUS GUI controller server."""
-    try:
-        runtime.start_control_server()
-        runtime.run_controller()
-    except Exception as e:
-        print(f"[curv_proper_code] Controller GUI info: {e}")
-
-
-# Launch GUI in background thread when imported
-gui_thread = threading.Thread(target=run_gui, daemon=True)
-gui_thread.start()
-
-if __name__ == "__main__":
-    gui_thread.join()
+runtime.stop_control_server()
+runtime.disconnect()
+print("Done.")

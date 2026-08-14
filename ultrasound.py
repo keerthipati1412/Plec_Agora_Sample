@@ -254,72 +254,79 @@ def replicate_mouse_event(event_type: str, x_percent: float, y_percent: float) -
     return True
 
 
-_curv_module = None
+# --- Dynamic OSTB Hooks (Leaves curv_proper_code.py 100% original and untouched!) ---
 _global_ostb_runtime = None
+_global_ostb_config = None
+
+try:
+    import ostb._ostb as ostb
+
+    # Hook 1: Intercept AcquisitionRuntime instantiation to capture runtime object
+    _orig_runtime_init = ostb.AcquisitionRuntime.__init__
+    def _hooked_runtime_init(self, *args, **kwargs):
+        global _global_ostb_runtime
+        _global_ostb_runtime = self
+        print(f"[ultrasound Hook] Automatically captured ostb.AcquisitionRuntime instance: {self}")
+        return _orig_runtime_init(self, *args, **kwargs)
+    ostb.AcquisitionRuntime.__init__ = _hooked_runtime_init
+
+    # Hook 2: Intercept run_controller() to run non-blocking in background thread
+    _orig_run_controller = ostb.AcquisitionRuntime.run_controller
+    def _hooked_run_controller(self, *args, **kwargs):
+        def _gui_worker():
+            try:
+                _orig_run_controller(self, *args, **kwargs)
+            except Exception as e:
+                print(f"[ultrasound Hook] Controller GUI info: {e}")
+        t = threading.Thread(target=_gui_worker, daemon=True)
+        t.start()
+        print("[ultrasound Hook] Launched run_controller() in non-blocking background thread!")
+    ostb.AcquisitionRuntime.run_controller = _hooked_run_controller
+
+    # Hook 3: Intercept configure() to capture configuration object
+    _orig_configure = ostb.AcquisitionRuntime.configure
+    def _hooked_configure(self, config, *args, **kwargs):
+        global _global_ostb_config
+        _global_ostb_config = config
+        print(f"[ultrasound Hook] Captured AcquisitionConfiguration: {config}")
+        return _orig_configure(self, config, *args, **kwargs)
+    ostb.AcquisitionRuntime.configure = _hooked_configure
+
+except Exception as exc:
+    print(f"[ultrasound Hook] OSTB hook info: {exc}")
 
 
 def execute_direct_runtime_command(name: str, value: any) -> bool:
     """
-    Directly invokes Python controller functions in curv_proper_code.py:
-    - start: start_acquisition() / stop_acquisition()
-    - freeze: stop_acquisition()
-    - voltage: set_voltage(val)
-    - gain: set_gain(val)
-    - display: set_display(val)
+    Directly invokes OSTB Python AcquisitionRuntime methods:
+    - start: runtime.start()
+    - freeze: runtime.stop()
+    Works 100% directly via Python functions without modifying curv_proper_code.py!
     """
-    global _curv_module, _global_ostb_runtime
+    global _global_ostb_runtime
     print(f"[Direct Function Call] Executing '{name}' = {value}")
 
-    # 1. Try explicit functions defined in curv_proper_code.py
-    if _curv_module is not None:
-        try:
-            if name == "start":
-                if value:
-                    print("[curv_proper_code] Calling start_acquisition()")
-                    if hasattr(_curv_module, "start_acquisition"):
-                        return _curv_module.start_acquisition()
-                else:
-                    print("[curv_proper_code] Calling stop_acquisition()")
-                    if hasattr(_curv_module, "stop_acquisition"):
-                        return _curv_module.stop_acquisition()
-            elif name == "freeze":
-                print("[curv_proper_code] Calling stop_acquisition()")
-                if hasattr(_curv_module, "stop_acquisition"):
-                    return _curv_module.stop_acquisition()
-            elif name == "voltage":
-                print(f"[curv_proper_code] Calling set_voltage({value})")
-                if hasattr(_curv_module, "set_voltage"):
-                    return _curv_module.set_voltage(float(value))
-            elif name == "gain":
-                print(f"[curv_proper_code] Calling set_gain({value})")
-                if hasattr(_curv_module, "set_gain"):
-                    return _curv_module.set_gain(float(value))
-            elif name == "display":
-                print(f"[curv_proper_code] Calling set_display({value})")
-                if hasattr(_curv_module, "set_display"):
-                    return _curv_module.set_display(bool(value))
-        except Exception as exc:
-            print(f"[curv_proper_code] Function call info: {exc}")
-
-    # 2. Try _global_ostb_runtime direct methods
     if _global_ostb_runtime is not None:
         try:
             if name == "start":
                 if value:
+                    print("[Direct OSTB API] Executing _global_ostb_runtime.start()")
                     if hasattr(_global_ostb_runtime, "start"):
                         _global_ostb_runtime.start()
                 else:
+                    print("[Direct OSTB API] Executing _global_ostb_runtime.stop()")
                     if hasattr(_global_ostb_runtime, "stop"):
                         _global_ostb_runtime.stop()
                 return True
             elif name == "freeze":
+                print("[Direct OSTB API] Executing _global_ostb_runtime.stop()")
                 if hasattr(_global_ostb_runtime, "stop"):
                     _global_ostb_runtime.stop()
                 return True
         except Exception as exc:
-            print(f"[OSTB Runtime] Direct method info: {exc}")
+            print(f"[Direct OSTB API] Direct method error: {exc}")
 
-    # 3. Fallback to OSTB TCP Socket (127.0.0.1:4096) and Win32 event messaging
+    # Fallback to OSTB TCP Socket (127.0.0.1:4096) and Win32 event messaging
     return handle_control_command(name, value)
     """
     Sends a direct control command to the OSTB Control Server TCP socket on 127.0.0.1:4096.
