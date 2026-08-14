@@ -2025,9 +2025,9 @@ select {
 
 /* Acquisition Left Panel */
 .acquisition-buttons {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .acq-btn {
@@ -2043,42 +2043,40 @@ select {
   border: 1px solid #cbd5e1;
   transition: all 0.2s ease;
   font-family: inherit;
+  width: 100%;
 }
 
-/* Start Button: Blue when active */
+/* Start / Stop Button: Vivid Blue background */
 .acq-btn.start-btn {
-  background: #f1f5f9;
-  color: #3b82f6;
+  background: #3b82f6;
+  color: #ffffff;
+  border-color: #2563eb;
 }
 
-.acq-btn.start-btn.active {
+.acq-btn.start-btn:hover {
+  background: #2563eb;
+}
+
+.acq-btn.start-btn.running-stop-btn {
   background: #2563eb;
   color: #ffffff;
-  border-color: #1d4ed8;
 }
 
-.acq-btn.start-btn.active:hover {
-  background: #1d4ed8;
+/* Freeze Button: Light grey background with blue snowflake */
+.acq-btn.freeze-btn {
+  background: #f1f5f9;
+  color: #1e293b;
+  border-color: #e2e8f0;
 }
 
-.acq-btn.start-btn:not(.active):hover {
+.acq-btn.freeze-btn:hover {
   background: #e2e8f0;
 }
 
-/* Freeze Button: Active state is freezing */
-.acq-btn.freeze-btn {
-  background: #f1f5f9;
-  color: #4b5563;
-}
-
-.acq-btn.freeze-btn.active {
-  background: #e5e7eb;
-  color: #1e293b;
-  border-color: #cbd5e1;
-}
-
-.acq-btn.freeze-btn.active:hover {
-  background: #d1d5db;
+.controls-divider-line {
+  height: 1px;
+  background: #e2e8f0;
+  margin: 10px 0;
 }
 
 .acq-icon {

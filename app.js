@@ -1726,21 +1726,47 @@ if (controlsModal) {
 const controlStartBtn = document.getElementById("controlStartBtn");
 const controlFreezeBtn = document.getElementById("controlFreezeBtn");
 const controlStatusLabel = document.getElementById("controlStatusLabel");
+const startBtnText = document.getElementById("startBtnText");
+const startBtnIcon = document.getElementById("startBtnIcon");
+
+let isRunningState = false;
 
 if (controlStartBtn && controlFreezeBtn && controlStatusLabel) {
   controlStartBtn.addEventListener("click", () => {
-    controlStartBtn.classList.add("active");
-    controlFreezeBtn.classList.remove("active");
-    controlStatusLabel.textContent = "RUNNING";
-    controlStatusLabel.className = "status-val running";
-    sendControlCommand("start", true);
+    isRunningState = !isRunningState;
+    if (isRunningState) {
+      controlStartBtn.classList.add("active", "running-stop-btn");
+      controlFreezeBtn.classList.remove("active");
+      controlStatusLabel.textContent = "RUNNING";
+      controlStatusLabel.className = "status-val running";
+      if (startBtnText) startBtnText.textContent = "Stop";
+      if (startBtnIcon) {
+        startBtnIcon.innerHTML = `<rect x="6" y="6" width="12" height="12" fill="currentColor"/>`;
+      }
+      sendControlCommand("start", true);
+    } else {
+      controlStartBtn.classList.remove("running-stop-btn");
+      controlStartBtn.classList.add("active");
+      controlStatusLabel.textContent = "STOPPED";
+      controlStatusLabel.className = "status-val stopped";
+      if (startBtnText) startBtnText.textContent = "Start";
+      if (startBtnIcon) {
+        startBtnIcon.innerHTML = `<path d="M8 5v14l11-7z" fill="currentColor"/>`;
+      }
+      sendControlCommand("start", false);
+    }
   });
 
   controlFreezeBtn.addEventListener("click", () => {
     controlFreezeBtn.classList.add("active");
-    controlStartBtn.classList.remove("active");
+    controlStartBtn.classList.remove("active", "running-stop-btn");
     controlStatusLabel.textContent = "STOPPED";
     controlStatusLabel.className = "status-val stopped";
+    isRunningState = false;
+    if (startBtnText) startBtnText.textContent = "Start";
+    if (startBtnIcon) {
+      startBtnIcon.innerHTML = `<path d="M8 5v14l11-7z" fill="currentColor"/>`;
+    }
     sendControlCommand("freeze", true);
   });
 }
