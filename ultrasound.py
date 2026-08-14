@@ -118,7 +118,6 @@ def find_opensonics_control_window() -> int:
 
         # Match exact NEXUS control panel window
         if title == "NEXUS":
-            print(f"[Window Finder] >>> TARGETED NEXUS CONTROL WINDOW: hwnd={hwnd}, class={cls_name!r}")
             control_hwnd[0] = hwnd
             return False
         elif "Image" in title or "Focused" in title or "B-Mode" in title:

@@ -1,6 +1,7 @@
 from scipy.signal import firwin
 import numpy as np
 import math
+import threading
 
 import ostb._ostb as ostb
 
@@ -365,18 +366,18 @@ def get_current_status() -> dict:
     }
 
 
-runtime.start_control_server()
-runtime.run_controller()
+def run_gui() -> None:
+    """Runs the OpenSonics NEXUS GUI controller server."""
+    try:
+        runtime.start_control_server()
+        runtime.run_controller()
+    except Exception as e:
+        print(f"[curv_proper_code] Controller GUI info: {e}")
 
-print("Saving Acquired Data...", end="")
-ostb.save_acquisition_archive_hdf5(
-    configuration,
-    "capture_focused_curvilinear.h5",
-    include_rf_data=True,
-    include_process_output_data=True,
-)
-print(" OK")
 
-runtime.stop_control_server()
-runtime.disconnect()
-print("Done.")
+# Launch GUI in background thread when imported
+gui_thread = threading.Thread(target=run_gui, daemon=True)
+gui_thread.start()
+
+if __name__ == "__main__":
+    gui_thread.join()
