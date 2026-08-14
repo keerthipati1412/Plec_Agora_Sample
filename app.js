@@ -13,31 +13,47 @@ function connectDoctorMQTT(appId, channel) {
 
   const cleanAppId = targetAppId.substring(0, 8);
   doctorControlTopic = `${targetChannel}-control-${cleanAppId}`;
-  console.log(`[Doctor MQTT] Connecting to MQTT Broker on topic: ${doctorControlTopic}`);
 
-  if (doctorMqttClient && (doctorMqttClient.connected || doctorMqttClient.reconnecting)) {
+  if (doctorMqttClient && doctorMqttClient.connected) {
     return;
   }
 
-  try {
-    doctorMqttClient = mqtt.connect("wss://broker.hivemq.com:8000/mqtt");
-    
-    doctorMqttClient.on("connect", () => {
-      console.log(`[Doctor MQTT] Connected to broker. Topic: ${doctorControlTopic}`);
-      // Flush any queued payloads
-      while (pendingMqttPayloads.length > 0) {
-        const payload = pendingMqttPayloads.shift();
-        doctorMqttClient.publish(doctorControlTopic, payload);
-        console.log(`[Doctor MQTT] Flushed queued control to ${doctorControlTopic}:`, payload);
-      }
-    });
-    
-    doctorMqttClient.on("error", (err) => {
-      console.error("[Doctor MQTT] Connection error:", err);
-    });
-  } catch (e) {
-    console.error("[Doctor MQTT] Failed to instantiate connection:", e);
+  const brokerUrls = [
+    "wss://broker.hivemq.com:8884/mqtt",
+    "wss://broker.emqx.io:8084/mqtt"
+  ];
+  let attempts = 0;
+
+  function tryConnectDoctor() {
+    const url = brokerUrls[attempts % brokerUrls.length];
+    console.log(`[Doctor MQTT] Connecting to ${url} on topic: ${doctorControlTopic}`);
+    try {
+      doctorMqttClient = mqtt.connect(url, { keepalive: 30, reconnectPeriod: 3000 });
+      
+      doctorMqttClient.on("connect", () => {
+        console.log(`[Doctor MQTT] Connected to ${url} on topic: ${doctorControlTopic}`);
+        // Flush any queued payloads
+        while (pendingMqttPayloads.length > 0) {
+          const payload = pendingMqttPayloads.shift();
+          doctorMqttClient.publish(doctorControlTopic, payload);
+          console.log(`[Doctor MQTT] Flushed queued control to ${doctorControlTopic}:`, payload);
+        }
+      });
+      
+      doctorMqttClient.on("error", (err) => {
+        console.error(`[Doctor MQTT] Connection error on ${url}:`, err);
+        doctorMqttClient.end();
+        attempts++;
+        if (attempts < 4) {
+          setTimeout(tryConnectDoctor, 1500);
+        }
+      });
+    } catch (e) {
+      console.error("[Doctor MQTT] Exception on connection attempt:", e);
+    }
   }
+
+  tryConnectDoctor();
 }
 
 function sendControlCommand(name, value) {
