@@ -1722,14 +1722,57 @@ if (controlsModal) {
   }
 }
 
-// Acquisition controls (Start / Freeze)
-const controlStartBtn = document.getElementById("controlStartBtn");
-const controlFreezeBtn = document.getElementById("controlFreezeBtn");
-const controlStatusLabel = document.getElementById("controlStatusLabel");
-const startBtnText = document.getElementById("startBtnText");
-const startBtnIcon = document.getElementById("startBtnIcon");
+// Fetch initial parameters directly from curv_proper_code.py to sync Doctor controls
+async function syncDoctorControlsFromPatientState() {
+  try {
+    const res = await fetch("/api/status");
+    if (!res.ok) return;
+    const data = await res.json();
+    console.log("[Doctor UI] Synced state from curv_proper_code.py:", data);
 
-let isRunningState = false;
+    if (data.voltage !== undefined && voltageSlider && voltageValueInput) {
+      voltageSlider.value = data.voltage;
+      voltageValueInput.value = data.voltage;
+      updateSliderBackground(voltageSlider);
+    }
+
+    if (data.gain !== undefined && gainSlider && gainValueInput) {
+      gainSlider.value = data.gain;
+      gainValueInput.value = data.gain;
+      updateSliderBackground(gainSlider);
+    }
+
+    if (data.display !== undefined && displayToggle) {
+      displayToggle.checked = data.display;
+    }
+
+    if (data.status) {
+      isRunningState = (data.status === "RUNNING");
+      if (isRunningState) {
+        controlStartBtn.classList.add("active", "running-stop-btn");
+        controlFreezeBtn.classList.remove("active");
+        controlStatusLabel.textContent = "RUNNING";
+        controlStatusLabel.className = "status-val running";
+        if (startBtnText) startBtnText.textContent = "Stop";
+        if (startBtnIcon) startBtnIcon.innerHTML = `<rect x="6" y="6" width="12" height="12" fill="currentColor"/>`;
+      } else {
+        controlStartBtn.classList.remove("running-stop-btn");
+        controlStartBtn.classList.add("active");
+        controlStatusLabel.textContent = "STOPPED";
+        controlStatusLabel.className = "status-val stopped";
+        if (startBtnText) startBtnText.textContent = "Start";
+        if (startBtnIcon) startBtnIcon.innerHTML = `<path d="M8 5v14l11-7z" fill="currentColor"/>`;
+      }
+    }
+  } catch (err) {
+    console.warn("[Doctor UI] Sync state info:", err);
+  }
+}
+
+// Call state sync on page load
+document.addEventListener("DOMContentLoaded", () => {
+  setTimeout(syncDoctorControlsFromPatientState, 600);
+});
 
 if (controlStartBtn && controlFreezeBtn && controlStatusLabel) {
   controlStartBtn.addEventListener("click", () => {
