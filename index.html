@@ -344,6 +344,40 @@
               </div>
             </div>
 
+            <div class="slider-control-group">
+              <div class="slider-label-row">
+                <span class="slider-label">Log Compression Gain</span>
+                <div class="slider-value-container">
+                  <input id="logGainValueInput" class="slider-value-box" type="text" value="50" readonly />
+                  <span class="slider-unit">dB</span>
+                </div>
+              </div>
+              <div class="slider-input-row">
+                <button id="logGainMinus" class="slider-btn" type="button">-</button>
+                <div class="slider-track-container">
+                  <input id="logGainSlider" type="range" min="0" max="100" value="50" class="range-slider" />
+                </div>
+                <button id="logGainPlus" class="slider-btn" type="button">+</button>
+              </div>
+            </div>
+
+            <div class="slider-control-group">
+              <div class="slider-label-row">
+                <span class="slider-label">Dynamic Range</span>
+                <div class="slider-value-container">
+                  <input id="dynRangeValueInput" class="slider-value-box" type="text" value="60" readonly />
+                  <span class="slider-unit">dB</span>
+                </div>
+              </div>
+              <div class="slider-input-row">
+                <button id="dynRangeMinus" class="slider-btn" type="button">-</button>
+                <div class="slider-track-container">
+                  <input id="dynRangeSlider" type="range" min="20" max="80" value="60" class="range-slider" />
+                </div>
+                <button id="dynRangePlus" class="slider-btn" type="button">+</button>
+              </div>
+            </div>
+
             <!-- OpenSonics Stylized Logo -->
             <div class="opensonics-logo-container">
               <svg viewBox="0 0 200 60" width="160" height="48">

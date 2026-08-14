@@ -1841,6 +1841,84 @@ if (gainPlus && gainSlider) {
   });
 }
 
+// Log Compression Gain Slider
+const logGainSlider = document.getElementById("logGainSlider");
+const logGainValueInput = document.getElementById("logGainValueInput");
+const logGainMinus = document.getElementById("logGainMinus");
+const logGainPlus = document.getElementById("logGainPlus");
+
+if (logGainSlider && logGainValueInput) {
+  logGainSlider.addEventListener("input", () => {
+    logGainValueInput.value = logGainSlider.value;
+    updateSliderBackground(logGainSlider);
+  });
+  logGainSlider.addEventListener("change", () => {
+    sendControlCommand("log_gain", logGainSlider.value);
+  });
+  updateSliderBackground(logGainSlider);
+}
+
+if (logGainMinus && logGainSlider) {
+  logGainMinus.addEventListener("click", () => {
+    let val = parseInt(logGainSlider.value, 10);
+    if (val > parseInt(logGainSlider.min, 10)) {
+      logGainSlider.value = val - 1;
+      logGainSlider.dispatchEvent(new Event("input"));
+      logGainSlider.dispatchEvent(new Event("change"));
+    }
+  });
+}
+
+if (logGainPlus && logGainSlider) {
+  logGainPlus.addEventListener("click", () => {
+    let val = parseInt(logGainSlider.value, 10);
+    if (val < parseInt(logGainSlider.max, 10)) {
+      logGainSlider.value = val + 1;
+      logGainSlider.dispatchEvent(new Event("input"));
+      logGainSlider.dispatchEvent(new Event("change"));
+    }
+  });
+}
+
+// Dynamic Range Slider
+const dynRangeSlider = document.getElementById("dynRangeSlider");
+const dynRangeValueInput = document.getElementById("dynRangeValueInput");
+const dynRangeMinus = document.getElementById("dynRangeMinus");
+const dynRangePlus = document.getElementById("dynRangePlus");
+
+if (dynRangeSlider && dynRangeValueInput) {
+  dynRangeSlider.addEventListener("input", () => {
+    dynRangeValueInput.value = dynRangeSlider.value;
+    updateSliderBackground(dynRangeSlider);
+  });
+  dynRangeSlider.addEventListener("change", () => {
+    sendControlCommand("dynamic_range", dynRangeSlider.value);
+  });
+  updateSliderBackground(dynRangeSlider);
+}
+
+if (dynRangeMinus && dynRangeSlider) {
+  dynRangeMinus.addEventListener("click", () => {
+    let val = parseInt(dynRangeSlider.value, 10);
+    if (val > parseInt(dynRangeSlider.min, 10)) {
+      dynRangeSlider.value = val - 1;
+      dynRangeSlider.dispatchEvent(new Event("input"));
+      dynRangeSlider.dispatchEvent(new Event("change"));
+    }
+  });
+}
+
+if (dynRangePlus && dynRangeSlider) {
+  dynRangePlus.addEventListener("click", () => {
+    let val = parseInt(dynRangeSlider.value, 10);
+    if (val < parseInt(dynRangeSlider.max, 10)) {
+      dynRangeSlider.value = val + 1;
+      dynRangeSlider.dispatchEvent(new Event("input"));
+      dynRangeSlider.dispatchEvent(new Event("change"));
+    }
+  });
+}
+
 // TGC Slider Interaction
 const tgcToggle = document.getElementById("tgcToggle");
 const tgcSlidersContainer = document.getElementById("tgcSlidersContainer");
