@@ -1116,6 +1116,9 @@ def publisher_page():
       connectMQTT();
     }}
 
+    // Always connect MQTT immediately on page load regardless of Agora stream state
+    connectMQTT();
+
     start().catch((err) => {{
       setStatus(`Failed: ${{err?.message || err}}`);
       console.error(err);
