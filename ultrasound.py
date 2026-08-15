@@ -96,6 +96,59 @@ _latest_lock = threading.Lock()
 _stop_event = threading.Event()
 _ultrasound_proc: subprocess.Popen | None = None
 
+# MQTT control topic — must match exactly what app.js publishes to
+MQTT_CONTROL_TOPIC = f"{CHANNEL}-control-{APP_ID[:8]}"
+MQTT_BROKERS = [
+    ("broker.hivemq.com", 1883),
+    ("broker.emqx.io", 1883),
+]
+
+
+def _start_mqtt_subscriber() -> None:
+    """
+    Subscribes to MQTT control topic and directly calls execute_direct_runtime_command
+    when the Doctor publishes control commands (start, stop, voltage, gain etc.).
+    Runs in a background thread — no changes needed to curv_proper_code.py.
+    """
+    import json
+    try:
+        import paho.mqtt.client as mqtt_client
+    except ImportError:
+        print("[MQTT] paho-mqtt not installed. Run: pip install paho-mqtt")
+        return
+
+    def on_connect(client, userdata, flags, rc):
+        if rc == 0:
+            client.subscribe(MQTT_CONTROL_TOPIC)
+            print(f"[MQTT] Subscribed to topic: {MQTT_CONTROL_TOPIC}")
+        else:
+            print(f"[MQTT] Connection failed with code {rc}")
+
+    def on_message(client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode())
+            control = payload.get("control")
+            value = payload.get("value")
+            print(f"[MQTT] Received control command: {control} = {value}")
+            if control:
+                execute_direct_runtime_command(control, value)
+        except Exception as e:
+            print(f"[MQTT] Error handling message: {e}")
+
+    for broker_host, broker_port in MQTT_BROKERS:
+        try:
+            client = mqtt_client.Client()
+            client.on_connect = on_connect
+            client.on_message = on_message
+            client.connect(broker_host, broker_port, keepalive=60)
+            print(f"[MQTT] Connecting to {broker_host}:{broker_port}, topic: {MQTT_CONTROL_TOPIC}")
+            client.loop_forever()
+            break
+        except Exception as e:
+            print(f"[MQTT] Failed to connect to {broker_host}: {e}. Trying next broker...")
+
+
+
 
 def find_opensonics_control_window() -> int:
     """
@@ -1114,6 +1167,10 @@ def main() -> None:
 
     output_thread = threading.Thread(target=_process_output_loop, daemon=True)
     output_thread.start()
+
+    # Start MQTT subscriber to receive Doctor control commands
+    mqtt_thread = threading.Thread(target=_start_mqtt_subscriber, daemon=True)
+    mqtt_thread.start()
 
     atexit.register(_cleanup)
 
