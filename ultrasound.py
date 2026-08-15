@@ -493,6 +493,7 @@ def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float
 
 
 
+def execute_direct_runtime_command(name: str, value: any) -> bool:
     """
     Directly invokes OSTB Python AcquisitionRuntime methods.
     Handles: start, stop, freeze, voltage, gain, log_gain, dynamic_range, display.
