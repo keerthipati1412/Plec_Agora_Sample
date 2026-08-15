@@ -1774,6 +1774,8 @@ document.addEventListener("DOMContentLoaded", () => {
   setTimeout(syncDoctorControlsFromPatientState, 600);
 });
 
+let isRunningState = false;
+
 if (controlStartBtn && controlFreezeBtn && controlStatusLabel) {
   controlStartBtn.addEventListener("click", () => {
     isRunningState = !isRunningState;
