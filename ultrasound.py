@@ -386,7 +386,113 @@ except Exception as exc:
     print(f"[ultrasound Hook] OSTB hook info: {exc}")
 
 
-def execute_direct_runtime_command(name: str, value: any) -> bool:
+def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float = None) -> bool:
+    """
+    Rebuilds the waveform, TX configs, scans, sequence and full AcquisitionConfiguration
+    from scratch using the current _curv_module parameters — then calls runtime.configure()
+    with the freshly-built configuration so hardware actually sees the new values.
+
+    This is necessary because OSTB Builder objects serialize their values at .build() time —
+    mutating Python attributes after .build() has no effect on already-built C++ objects.
+    """
+    global _global_ostb_runtime, _curv_module
+    if _curv_module is None or _global_ostb_runtime is None:
+        print("[Rebuild] Cannot rebuild — module or runtime not ready")
+        return False
+
+    try:
+        import ostb._ostb as ostb_mod
+        m = _curv_module  # shorthand
+
+        # Update stored parameters
+        if new_voltage is not None:
+            m.gain_analog_db = getattr(m, "gain_analog_db", 40.0)
+        if new_gain is not None:
+            m.gain_analog_db = new_gain
+
+        voltage = new_voltage if new_voltage is not None else getattr(m, "_current_voltage", 50.0)
+        m._current_voltage = voltage
+        gain = m.gain_analog_db
+
+        print(f"[Rebuild] Rebuilding configuration: voltage={voltage}V, gain={gain}dB")
+
+        # Rebuild waveform with new voltage
+        new_waveform = ostb_mod.WaveformFactory.make_unipolar(m.center_frequency_hz)
+        new_waveform.set_awg(False)
+        new_waveform.set_negative_voltage(voltage)
+        new_waveform.validate()
+
+        # Rebuild sequence with new waveform and gain
+        new_seq_builder = (ostb_mod.SequenceBuilder()
+                           .set_probe(m.probe)
+                           .set_trigger(m.trigger)
+                           .set_number_of_frames(m.frame_count))
+
+        for line_idx in range(m.line_count):
+            start = line_idx
+            apodization = [0.0] * m.probe.element_count
+            apodization[start: start + m.active_element_count] = [1.0] * m.active_element_count
+
+            center_idx = start + m.active_element_count // 2 - (
+                1 if (m.active_element_count % 2 == 0) else 0
+            )
+
+            import math
+            azimuth_rad = m.probe.az_angle[center_idx]
+            radius_m = m.probe.radius
+            rho_m = radius_m + m.focus_depth_m
+            x_focus_m = rho_m * math.sin(azimuth_rad)
+            z_focus_m = -radius_m + rho_m * math.cos(azimuth_rad)
+
+            tx_config = (ostb_mod.TxConfigBuilder()
+                         .set_apodization(apodization)
+                         .set_source([0.0, 0.0, 0.0])
+                         .set_focus_point([x_focus_m, 0.0, z_focus_m])
+                         .set_tx_with_all_elements(False)
+                         .set_waveform(new_waveform)
+                         .set_speed_of_sound(m.speed_of_sound)
+                         .compute_delays(m.probe)
+                         .build(m.probe))
+
+            scan = (ostb_mod.ScanBuilder()
+                    .set_tx(tx_config)
+                    .set_rx(m.rxConfig)
+                    .set_process_id(0)
+                    .set_scan_id(line_idx)
+                    .set_frame_id(0)
+                    .set_gain_digital(0.0)
+                    .set_gain_analog(gain)
+                    .set_start(m.scan_start_s)
+                    .set_range(m.scan_range_s)
+                    .set_time_slot(m.time_slot_seconds)
+                    .set_sample_factor(m.sample_factor)
+                    .set_compression_type(ostb_mod.CompressionType.DECIMATION)
+                    .set_rectification(ostb_mod.Rectification.SIGNED)
+                    .set_beam_correction(0.0)
+                    .build(m.probe.element_count))
+
+            new_seq_builder.add_scan(scan)
+
+        new_seq = new_seq_builder.build()
+
+        # Rebuild configuration with new sequence
+        new_config = ostb_mod.AcquisitionConfiguration()
+        new_config.set_root(m.root)
+        new_config.set_sequence(new_seq)
+        new_config.set_processing(m.processing)
+        new_config.validate()
+
+        # Apply new configuration to hardware
+        _global_ostb_runtime.configure(new_config)
+        print(f"[Rebuild] ✅ Hardware reconfigured: voltage={voltage}V, gain={gain}dB")
+        return True
+
+    except Exception as e:
+        print(f"[Rebuild] ❌ Error rebuilding configuration: {e}")
+        return False
+
+
+
     """
     Directly invokes OSTB Python AcquisitionRuntime methods.
     Handles: start, stop, freeze, voltage, gain, log_gain, dynamic_range, display.
@@ -415,27 +521,17 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
             _global_ostb_runtime.stop()
             return True
 
-        # --- Voltage: waveform.set_negative_voltage(val) + runtime.configure ---
+        # --- Voltage: rebuild full configuration with new voltage ---
         elif name == "voltage":
             val = max(0.0, min(50.0, float(value)))
-            print(f"[Direct OSTB API] Setting voltage → {val} V")
-            if _curv_module is not None and hasattr(_curv_module, "waveform"):
-                _curv_module.waveform.set_negative_voltage(val)
-                if hasattr(_curv_module, "configuration"):
-                    _global_ostb_runtime.configure(_curv_module.configuration)
-                    print(f"[Direct OSTB API] Voltage set to {val} V and reconfigured")
-            return True
+            print(f"[Direct OSTB API] Setting voltage → {val} V (full rebuild)")
+            return rebuild_configuration_with_params(new_voltage=val)
 
-        # --- Analog Gain: rebuild scan sequence with new gain_analog_db + reconfigure ---
+        # --- Analog Gain: rebuild full configuration with new gain ---
         elif name == "gain":
             val = max(0.0, min(80.0, float(value)))
-            print(f"[Direct OSTB API] Setting analog gain → {val} dB")
-            if _curv_module is not None:
-                _curv_module.gain_analog_db = val
-                if hasattr(_curv_module, "configuration"):
-                    _global_ostb_runtime.configure(_curv_module.configuration)
-                    print(f"[Direct OSTB API] Gain set to {val} dB and reconfigured")
-            return True
+            print(f"[Direct OSTB API] Setting analog gain → {val} dB (full rebuild)")
+            return rebuild_configuration_with_params(new_gain=val)
 
         # --- Log Compression Gain ---
         elif name == "log_gain":
