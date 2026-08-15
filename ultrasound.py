@@ -257,6 +257,25 @@ def replicate_mouse_event(event_type: str, x_percent: float, y_percent: float) -
 # --- Dynamic OSTB Hooks (Leaves curv_proper_code.py 100% original and untouched!) ---
 _global_ostb_runtime = None
 _global_ostb_config = None
+_curv_module = None
+
+
+def _watch_module_runtime() -> None:
+    """
+    Monitors module.__dict__ while curv_proper_code.py executes.
+    Captures 'runtime' object immediately when line 'runtime = ostb.AcquisitionRuntime()' executes,
+    BEFORE runtime.run_controller() blocks the thread.
+    """
+    global _global_ostb_runtime, _curv_module
+    for _ in range(100):
+        if _curv_module is not None:
+            r = getattr(_curv_module, "runtime", None)
+            if r is not None:
+                _global_ostb_runtime = r
+                print(f"[ultrasound Watcher] >>> SUCCESS! CAPTURED RUNTIME INSTANCE: {r}")
+                break
+        time.sleep(0.1)
+
 
 try:
     import ostb._ostb as ostb
@@ -282,15 +301,6 @@ try:
         t.start()
         print("[ultrasound Hook] Launched run_controller() in non-blocking background thread!")
     ostb.AcquisitionRuntime.run_controller = _hooked_run_controller
-
-    # Hook 3: Intercept configure() to capture configuration object
-    _orig_configure = ostb.AcquisitionRuntime.configure
-    def _hooked_configure(self, config, *args, **kwargs):
-        global _global_ostb_config
-        _global_ostb_config = config
-        print(f"[ultrasound Hook] Captured AcquisitionConfiguration: {config}")
-        return _orig_configure(self, config, *args, **kwargs)
-    ostb.AcquisitionRuntime.configure = _hooked_configure
 
 except Exception as exc:
     print(f"[ultrasound Hook] OSTB hook info: {exc}")
@@ -734,10 +744,14 @@ def _run_curv_proper_code_thread() -> None:
         return
 
     print(f"[ultrasound] Importing and executing {ULTRASOUND_SCRIPT} in-process...")
-    try:
         spec = importlib.util.spec_from_file_location("curv_proper_module", str(script_path))
         module = importlib.util.module_from_spec(spec)
         _curv_module = module
+
+        # Start watcher thread to capture module.runtime in real time
+        watcher = threading.Thread(target=_watch_module_runtime, daemon=True)
+        watcher.start()
+
         spec.loader.exec_module(module)
         if hasattr(module, "runtime"):
             _global_ostb_runtime = module.runtime
