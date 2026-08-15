@@ -388,52 +388,89 @@ except Exception as exc:
 
 def execute_direct_runtime_command(name: str, value: any) -> bool:
     """
-    Directly invokes OSTB Python AcquisitionRuntime methods:
-    - start: runtime.start()
-    - freeze: runtime.stop()
-    Works 100% directly via Python functions without modifying curv_proper_code.py!
+    Directly invokes OSTB Python AcquisitionRuntime methods.
+    Handles: start, stop, freeze, voltage, gain, log_gain, dynamic_range, display.
+    Works 100% directly via Python memory without modifying curv_proper_code.py!
     """
-    global _global_ostb_runtime
+    global _global_ostb_runtime, _curv_module
     print(f"[Direct Function Call] Executing '{name}' = {value}")
 
-    if _global_ostb_runtime is not None:
-        try:
-            if name == "start":
-                if value:
-                    print("[Direct OSTB API] Executing _global_ostb_runtime.start()")
-                    if hasattr(_global_ostb_runtime, "start"):
-                        _global_ostb_runtime.start()
-                else:
-                    print("[Direct OSTB API] Executing _global_ostb_runtime.stop()")
-                    if hasattr(_global_ostb_runtime, "stop"):
-                        _global_ostb_runtime.stop()
-                return True
-            elif name == "freeze":
-                print("[Direct OSTB API] Executing _global_ostb_runtime.stop()")
-                if hasattr(_global_ostb_runtime, "stop"):
-                    _global_ostb_runtime.stop()
-                return True
-        except Exception as exc:
-            print(f"[Direct OSTB API] Direct method error: {exc}")
-
-    # Fallback to OSTB TCP Socket (127.0.0.1:4096) and Win32 event messaging
-    return handle_control_command(name, value)
-    """
-    Sends a direct control command to the OSTB Control Server TCP socket on 127.0.0.1:4096.
-    This bypasses GUI pixel coordinates completely and works across all screen resolutions and systems.
-    """
-    try:
-        import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(0.4)
-        s.connect(("127.0.0.1", 4096))
-        payload = json.dumps({"command": cmd, "control": cmd, "value": val}) + "\n"
-        s.sendall(payload.encode("utf-8"))
-        s.close()
-        print(f"[Remote Control Socket] Successfully sent direct OSTB command '{cmd}'={val} to 127.0.0.1:4096")
-        return True
-    except Exception:
+    if _global_ostb_runtime is None:
+        print("[Direct Function Call] Runtime not ready yet — skipping")
         return False
+
+    try:
+        # --- Start / Stop ---
+        if name == "start":
+            if value:
+                print("[Direct OSTB API] Executing _global_ostb_runtime.start()")
+                _global_ostb_runtime.start()
+            else:
+                print("[Direct OSTB API] Executing _global_ostb_runtime.stop()")
+                _global_ostb_runtime.stop()
+            return True
+
+        elif name == "freeze":
+            print("[Direct OSTB API] Executing _global_ostb_runtime.stop()")
+            _global_ostb_runtime.stop()
+            return True
+
+        # --- Voltage: waveform.set_negative_voltage(val) + runtime.configure ---
+        elif name == "voltage":
+            val = max(0.0, min(50.0, float(value)))
+            print(f"[Direct OSTB API] Setting voltage → {val} V")
+            if _curv_module is not None and hasattr(_curv_module, "waveform"):
+                _curv_module.waveform.set_negative_voltage(val)
+                if hasattr(_curv_module, "configuration"):
+                    _global_ostb_runtime.configure(_curv_module.configuration)
+                    print(f"[Direct OSTB API] Voltage set to {val} V and reconfigured")
+            return True
+
+        # --- Analog Gain: rebuild scan sequence with new gain_analog_db + reconfigure ---
+        elif name == "gain":
+            val = max(0.0, min(80.0, float(value)))
+            print(f"[Direct OSTB API] Setting analog gain → {val} dB")
+            if _curv_module is not None:
+                _curv_module.gain_analog_db = val
+                if hasattr(_curv_module, "configuration"):
+                    _global_ostb_runtime.configure(_curv_module.configuration)
+                    print(f"[Direct OSTB API] Gain set to {val} dB and reconfigured")
+            return True
+
+        # --- Log Compression Gain ---
+        elif name == "log_gain":
+            val = max(0.0, min(100.0, float(value)))
+            print(f"[Direct OSTB API] Setting log compression gain → {val} dB")
+            if _curv_module is not None and hasattr(_curv_module, "log"):
+                _curv_module.log.gain_db = val
+                if hasattr(_curv_module, "configuration"):
+                    _global_ostb_runtime.configure(_curv_module.configuration)
+            return True
+
+        # --- Dynamic Range ---
+        elif name == "dynamic_range":
+            val = max(0.0, min(120.0, float(value)))
+            print(f"[Direct OSTB API] Setting dynamic range → {val} dB")
+            if _curv_module is not None and hasattr(_curv_module, "log"):
+                _curv_module.log.dynamic_range_db = val
+                if hasattr(_curv_module, "configuration"):
+                    _global_ostb_runtime.configure(_curv_module.configuration)
+            return True
+
+        # --- Display Toggle ---
+        elif name == "display":
+            enabled = bool(value)
+            print(f"[Direct OSTB API] Setting display → {enabled}")
+            if _curv_module is not None and hasattr(_curv_module, "processing"):
+                _curv_module.processing.set_enable_display(enabled)
+                if hasattr(_curv_module, "configuration"):
+                    _global_ostb_runtime.configure(_curv_module.configuration)
+            return True
+
+    except Exception as exc:
+        print(f"[Direct OSTB API] Error executing '{name}': {exc}")
+
+    return False
 
 
 def send_direct_qt_click(hwnd: int, cx: int, cy: int) -> None:
