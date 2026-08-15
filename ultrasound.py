@@ -63,8 +63,8 @@ if MISSING_MODULES:
   )
 
 # -------------------- USER CONFIG --------------------
-APP_ID = "0c7395d7882e46dcb6400d79ed3fc41c"
-TOKEN = "007eJxTYEi/EmN2VG5/g1uQeoykwIOtXu6XDmc+srkqqJqVet9T7bsCg0GyubGlaYq5hYVRqolZSnKSmYmBQYq5ZWqKcVqyiWGy4uq6rIZARoYyoUpGRgYIBPFZGUryi0qLGRgA+PgeQA=="
+APP_ID = "c0a161db8ff24fb5b5aed83406476245"
+TOKEN = "007eJxTYHiTeZnVsowjqXN340L/biONVlmdHXcLIhyeMP+XKi7ZqKfAkGyQaGhmmJJkkZZmZJKWZJpkmpiaYmFsYmBmYm5mZGIq9a8+qyGQkaEydgozIwMEgvisDCX5RaXFDAwA9g0eZQ=="
 CHANNEL = "torus"
 UID = 5001
 
