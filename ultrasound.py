@@ -117,12 +117,13 @@ def _start_mqtt_subscriber() -> None:
         print("[MQTT] paho-mqtt not installed. Run: pip install paho-mqtt")
         return
 
-    def on_connect(client, userdata, flags, rc):
-        if rc == 0:
+    def on_connect(client, userdata, flags, reason_code, properties=None):
+        # paho-mqtt 2.x passes reason_code; 0 means success
+        if reason_code == 0 or str(reason_code) == "Success":
             client.subscribe(MQTT_CONTROL_TOPIC)
             print(f"[MQTT] Subscribed to topic: {MQTT_CONTROL_TOPIC}")
         else:
-            print(f"[MQTT] Connection failed with code {rc}")
+            print(f"[MQTT] Connection failed: {reason_code}")
 
     def on_message(client, userdata, msg):
         try:
@@ -137,11 +138,16 @@ def _start_mqtt_subscriber() -> None:
 
     for broker_host, broker_port in MQTT_BROKERS:
         try:
-            client = mqtt_client.Client()
+            # paho-mqtt 2.x requires CallbackAPIVersion
+            try:
+                client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
+            except AttributeError:
+                # paho-mqtt 1.x fallback
+                client = mqtt_client.Client()
             client.on_connect = on_connect
             client.on_message = on_message
-            client.connect(broker_host, broker_port, keepalive=60)
             print(f"[MQTT] Connecting to {broker_host}:{broker_port}, topic: {MQTT_CONTROL_TOPIC}")
+            client.connect(broker_host, broker_port, keepalive=60)
             client.loop_forever()
             break
         except Exception as e:
