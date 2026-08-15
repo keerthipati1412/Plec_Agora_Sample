@@ -106,9 +106,8 @@ MQTT_BROKERS = [
 
 def _start_mqtt_subscriber() -> None:
     """
-    Subscribes to MQTT control topic and directly calls execute_direct_runtime_command
-    when the Doctor publishes control commands (start, stop, voltage, gain etc.).
-    Runs in a background thread — no changes needed to curv_proper_code.py.
+    Subscribes to MQTT control topic on ALL brokers simultaneously.
+    Doctor JS may connect to any broker (HiveMQ or EMQX) — patient Python listens on both.
     """
     import json
     try:
@@ -117,41 +116,47 @@ def _start_mqtt_subscriber() -> None:
         print("[MQTT] paho-mqtt not installed. Run: pip install paho-mqtt")
         return
 
-    def on_connect(client, userdata, flags, reason_code, properties=None):
-        # paho-mqtt 2.x passes reason_code; 0 means success
-        if reason_code == 0 or str(reason_code) == "Success":
-            client.subscribe(MQTT_CONTROL_TOPIC)
-            print(f"[MQTT] Subscribed to topic: {MQTT_CONTROL_TOPIC}")
-        else:
-            print(f"[MQTT] Connection failed: {reason_code}")
+    def make_client(broker_host, broker_port):
+        def on_connect(client, userdata, flags, reason_code, properties=None):
+            if reason_code == 0 or str(reason_code) == "Success":
+                client.subscribe(MQTT_CONTROL_TOPIC)
+                print(f"[MQTT] ✅ Subscribed on {broker_host}:{broker_port} → topic: {MQTT_CONTROL_TOPIC}")
+            else:
+                print(f"[MQTT] ❌ Failed on {broker_host}: {reason_code}")
 
-    def on_message(client, userdata, msg):
-        try:
-            payload = json.loads(msg.payload.decode())
-            control = payload.get("control")
-            value = payload.get("value")
-            print(f"[MQTT] Received control command: {control} = {value}")
-            if control:
-                execute_direct_runtime_command(control, value)
-        except Exception as e:
-            print(f"[MQTT] Error handling message: {e}")
+        def on_message(client, userdata, msg):
+            try:
+                payload = json.loads(msg.payload.decode())
+                control = payload.get("control")
+                value = payload.get("value")
+                print(f"[MQTT] ✅ Received from {broker_host}: {control} = {value}")
+                if control:
+                    execute_direct_runtime_command(control, value)
+            except Exception as e:
+                print(f"[MQTT] Error handling message from {broker_host}: {e}")
 
-    for broker_host, broker_port in MQTT_BROKERS:
         try:
-            # paho-mqtt 2.x requires CallbackAPIVersion
             try:
                 client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
             except AttributeError:
-                # paho-mqtt 1.x fallback
                 client = mqtt_client.Client()
             client.on_connect = on_connect
             client.on_message = on_message
             print(f"[MQTT] Connecting to {broker_host}:{broker_port}, topic: {MQTT_CONTROL_TOPIC}")
             client.connect(broker_host, broker_port, keepalive=60)
-            client.loop_forever()
-            break
+            client.loop_start()  # Non-blocking — runs in background thread
+            print(f"[MQTT] Listener started on {broker_host}:{broker_port}")
         except Exception as e:
-            print(f"[MQTT] Failed to connect to {broker_host}: {e}. Trying next broker...")
+            print(f"[MQTT] Could not connect to {broker_host}: {e}")
+
+    # Connect to ALL brokers simultaneously (non-blocking)
+    for broker_host, broker_port in MQTT_BROKERS:
+        t = threading.Thread(target=make_client, args=(broker_host, broker_port), daemon=True)
+        t.start()
+
+    # Keep thread alive
+    while not _stop_event.is_set():
+        time.sleep(5)
 
 
 
