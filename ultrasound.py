@@ -463,41 +463,7 @@ def handle_control_command(name: str, value: any) -> bool:
     return True
 
 
-def _position_window_offscreen_loop() -> None:
-    """
-    Finds the PyQt5 window and moves it off-screen immediately so the patient doesn't see it.
-    Keeps the window restored (not minimized) so Qt continues processing input and rendering.
-    """
-    try:
-        import win32gui
-        import win32con
-    except ImportError:
-        return
-
-    while not _stop_event.is_set():
-        if _click_lock.acquire(blocking=False):
-            try:
-                hwnd = find_opensonics_control_window()
-                if hwnd:
-                    if win32gui.IsIconic(hwnd):
-                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                    
-                    rect = win32gui.GetWindowRect(hwnd)
-                    left, top, right, bottom = rect
-                    if left != -2000 or top != -2000:
-                        print(f"[ultrasound] Positioning OpenSonics window off-screen (-2000, -2000) to prevent patient visibility.")
-                        win32gui.SetWindowPos(
-                            hwnd,
-                            0,
-                            -2000,
-                            -2000,
-                            800,
-                            600,
-                            win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW
-                        )
-            finally:
-                _click_lock.release()
-        time.sleep(0.3)
+# Window off-screen repositioning loop completely removed as requested.
 
 
 
@@ -702,8 +668,7 @@ def capture_render_window() -> np.ndarray:
         ctypes.windll.user32.PrintWindow(render_hwnd, saveDC.GetSafeHdc(), 2)
 
         bmpstr = saveBitMap.GetBitmapBits(True)
-        img = np.frombuffer(bmpstr, dtype='uint8')
-        img.shape = (h, w, 4)
+        img = np.frombuffer(bmpstr, dtype='uint8').reshape((h, w, 4))
 
         win32gui.DeleteObject(saveBitMap.GetHandle())
         saveDC.DeleteDC()
@@ -1115,10 +1080,6 @@ def main() -> None:
                 "Ultrasound script exited immediately. "
                 "Check [ultrasound] logs above for the root cause."
             )
-
-    # Start background thread to keep the OpenSonics GUI window off-screen
-    window_thread = threading.Thread(target=_position_window_offscreen_loop, daemon=True)
-    window_thread.start()
 
     output_thread = threading.Thread(target=_process_output_loop, daemon=True)
     output_thread.start()
