@@ -302,6 +302,22 @@ try:
         print("[ultrasound Hook] Launched run_controller() in non-blocking background thread!")
     ostb.AcquisitionRuntime.run_controller = _hooked_run_controller
 
+    # Hook 3: Block stop_control_server() — we want the runtime to stay alive
+    def _hooked_stop_control_server(self, *args, **kwargs):
+        print("[ultrasound Hook] Intercepted stop_control_server() — keeping runtime alive for remote control!")
+    ostb.AcquisitionRuntime.stop_control_server = _hooked_stop_control_server
+
+    # Hook 4: Block disconnect() — we want the runtime to stay connected to hardware
+    def _hooked_disconnect(self, *args, **kwargs):
+        print("[ultrasound Hook] Intercepted disconnect() — keeping runtime connected to hardware!")
+    ostb.AcquisitionRuntime.disconnect = _hooked_disconnect
+
+    # Hook 5: Block save_acquisition_archive_hdf5 — not needed for streaming
+    if hasattr(ostb, "save_acquisition_archive_hdf5"):
+        def _hooked_save(*args, **kwargs):
+            print("[ultrasound Hook] Intercepted save_acquisition_archive_hdf5() — skipping HDF5 save for streaming mode!")
+        ostb.save_acquisition_archive_hdf5 = _hooked_save
+
 except Exception as exc:
     print(f"[ultrasound Hook] OSTB hook info: {exc}")
 
