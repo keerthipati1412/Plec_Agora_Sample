@@ -744,6 +744,7 @@ def _run_curv_proper_code_thread() -> None:
         return
 
     print(f"[ultrasound] Importing and executing {ULTRASOUND_SCRIPT} in-process...")
+    try:
         spec = importlib.util.spec_from_file_location("curv_proper_module", str(script_path))
         module = importlib.util.module_from_spec(spec)
         _curv_module = module
