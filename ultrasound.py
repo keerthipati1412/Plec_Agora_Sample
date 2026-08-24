@@ -522,17 +522,21 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
             _global_ostb_runtime.stop()
             return True
 
-        # --- Voltage: rebuild full configuration with new voltage ---
+        # --- Voltage: rebuild full configuration with new voltage & sync patient GUI ---
         elif name == "voltage":
             val = max(0.0, min(50.0, float(value)))
             print(f"[Direct OSTB API] Setting voltage → {val} V (full rebuild)")
-            return rebuild_configuration_with_params(new_voltage=val)
+            res = rebuild_configuration_with_params(new_voltage=val)
+            handle_control_command("voltage", val)
+            return res
 
-        # --- Analog Gain: rebuild full configuration with new gain ---
+        # --- Analog Gain: rebuild full configuration with new gain & sync patient GUI ---
         elif name == "gain":
             val = max(0.0, min(80.0, float(value)))
             print(f"[Direct OSTB API] Setting analog gain → {val} dB (full rebuild)")
-            return rebuild_configuration_with_params(new_gain=val)
+            res = rebuild_configuration_with_params(new_gain=val)
+            handle_control_command("gain", val)
+            return res
 
         # --- Log Compression Gain ---
         elif name == "log_gain":
@@ -542,6 +546,7 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
                 _curv_module.log.gain_db = val
                 if hasattr(_curv_module, "configuration"):
                     _global_ostb_runtime.configure(_curv_module.configuration)
+            handle_control_command("log_gain", val)
             return True
 
         # --- Dynamic Range ---
@@ -552,6 +557,7 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
                 _curv_module.log.dynamic_range_db = val
                 if hasattr(_curv_module, "configuration"):
                     _global_ostb_runtime.configure(_curv_module.configuration)
+            handle_control_command("dynamic_range", val)
             return True
 
         # --- Display Toggle ---
@@ -562,12 +568,13 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
                 _curv_module.processing.set_enable_display(enabled)
                 if hasattr(_curv_module, "configuration"):
                     _global_ostb_runtime.configure(_curv_module.configuration)
+            handle_control_command("display", enabled)
             return True
 
     except Exception as exc:
         print(f"[Direct OSTB API] Error executing '{name}': {exc}")
 
-    return False
+    return handle_control_command(name, value)
 
 
 def send_direct_qt_click(hwnd: int, cx: int, cy: int) -> None:
