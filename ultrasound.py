@@ -350,6 +350,9 @@ def _watch_module_runtime() -> None:
             if r is not None:
                 _global_ostb_runtime = r
                 print(f"[ultrasound Watcher] >>> SUCCESS! CAPTURED RUNTIME INSTANCE: {r}")
+                # Print all available methods so we can find direct hardware setters
+                methods = [m for m in dir(r) if not m.startswith("__")]
+                print(f"[ultrasound Watcher] >>> RUNTIME METHODS: {methods}")
                 break
         time.sleep(0.1)
 
@@ -399,15 +402,113 @@ except Exception as exc:
     print(f"[ultrasound Hook] OSTB hook info: {exc}")
 
 
+def try_direct_runtime_setter(name: str, value: float) -> bool:
+    """
+    Tier 1: Try calling a direct setter on the runtime object that works WHILE RUNNING.
+    The NEXUS GUI uses pOEMPA->SetGainAnalog / SetVoltage directly — these are exposed
+    on the runtime as set_gain_analog() / set_voltage() if available.
+    Returns True if succeeded instantly without stopping acquisition.
+    """
+    global _global_ostb_runtime
+    if _global_ostb_runtime is None:
+        return False
+    try:
+        r = _global_ostb_runtime
+        if name == "gain":
+            for method in ("set_gain_analog", "set_analog_gain", "set_gain"):
+                if hasattr(r, method):
+                    getattr(r, method)(value)
+                    print(f"[FastPath] ✅ Direct {method}({value}) succeeded — no stop/start!")
+                    return True
+        elif name == "voltage":
+            for method in ("set_voltage", "set_negative_voltage", "set_tx_voltage"):
+                if hasattr(r, method):
+                    getattr(r, method)(value)
+                    print(f"[FastPath] ✅ Direct {method}({value}) succeeded — no stop/start!")
+                    return True
+    except Exception as e:
+        print(f"[FastPath] Direct setter error for '{name}': {e}")
+    return False
+
+
+def try_ostb_control_server(name: str, value: float) -> bool:
+    """
+    Tier 2: Send command to the OSTB control server at 127.0.0.1:4096.
+    This is the same path the NEXUS GUI uses for real-time parameter changes.
+    Tries multiple protocol formats used by OSTB control servers.
+    Returns True if succeeded instantly without stopping acquisition.
+    """
+    import socket, json as _json
+
+    control_port = 4096
+    # Try different formats — OSTB control server protocol variants
+    payloads_to_try = [
+        _json.dumps({"control": name, "value": value}) + "\n",
+        _json.dumps({"command": name, "value": value}) + "\n",
+        _json.dumps({"type": name, "data": value}) + "\n",
+        f"{name}={value}\n",
+    ]
+
+    for payload in payloads_to_try:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.3)
+            s.connect(("127.0.0.1", control_port))
+            s.sendall(payload.encode("utf-8"))
+            # Try to read response
+            try:
+                resp = s.recv(256).decode("utf-8", errors="ignore").strip()
+                if resp:
+                    print(f"[FastPath] ✅ Control server responded to '{name}'={value}: {resp!r}")
+                    s.close()
+                    return True
+            except Exception:
+                pass
+            s.close()
+            print(f"[FastPath] ✅ Control server accepted '{name}'={value} (no response — OK)")
+            return True
+        except ConnectionRefusedError:
+            print(f"[FastPath] ⚠️ Control server at 127.0.0.1:{control_port} not accepting connections")
+            return False
+        except Exception:
+            continue
+    return False
+
+
 def debounced_rebuild_voltage_gain(new_voltage: float = None, new_gain: float = None,
-                                   delay_s: float = 0.4) -> None:
+                                   delay_s: float = 0.35) -> None:
     """
     Schedules a rebuild after `delay_s` seconds. If called again before the timer fires,
     the previous timer is cancelled and the new value is used (debounce).
-    This prevents flooding the hardware with rapid slider-drag events.
+    First tries fast-path approaches — only falls back to full rebuild if needed.
     """
     global _rebuild_timer, _pending_voltage, _pending_gain
 
+    # --- Tier 1: Try instant direct runtime setter (no stop/start needed) ---
+    if new_voltage is not None:
+        if try_direct_runtime_setter("voltage", new_voltage):
+            with _pending_lock:
+                _pending_voltage = new_voltage
+            return  # Done instantly!
+    if new_gain is not None:
+        if try_direct_runtime_setter("gain", new_gain):
+            with _pending_lock:
+                _pending_gain = new_gain
+            return  # Done instantly!
+
+    # --- Tier 2: Try OSTB control server socket ---
+    if new_voltage is not None:
+        if try_ostb_control_server("voltage", new_voltage):
+            with _pending_lock:
+                _pending_voltage = new_voltage
+            return  # Done instantly!
+    if new_gain is not None:
+        if try_ostb_control_server("gain", new_gain):
+            with _pending_lock:
+                _pending_gain = new_gain
+            return  # Done instantly!
+
+    # --- Tier 3: Fall back to full debounced stop/rebuild/start ---
     def _do_rebuild():
         with _pending_lock:
             v = _pending_voltage
@@ -420,7 +521,6 @@ def debounced_rebuild_voltage_gain(new_voltage: float = None, new_gain: float = 
         if new_gain is not None:
             _pending_gain = new_gain
 
-        # Cancel previous pending timer
         if _rebuild_timer is not None and _rebuild_timer.is_alive():
             _rebuild_timer.cancel()
 
@@ -432,29 +532,25 @@ def debounced_rebuild_voltage_gain(new_voltage: float = None, new_gain: float = 
 
 def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float = None) -> bool:
     """
-    Rebuilds the waveform, TX configs, scans, sequence and full AcquisitionConfiguration
-    from scratch, then reconfigures hardware using stop → configure → start sequence.
-
-    OSTB hardware requires: stop() → configure(new_config) → start() to apply param changes.
+    Tier 3 fallback: Full stop → rebuild → configure → start cycle.
+    Only used when Tier 1 (direct setter) and Tier 2 (control server) both fail.
     """
     global _global_ostb_runtime, _curv_module
 
-    # Prevent concurrent rebuilds
     if not _rebuild_lock.acquire(blocking=False):
-        print("[Rebuild] ⚠️ Rebuild already in progress — skipping duplicate request")
+        print("[Rebuild] ⚠️ Rebuild already in progress — skipping")
         return False
 
     if _curv_module is None or _global_ostb_runtime is None:
         _rebuild_lock.release()
-        print("[Rebuild] ❌ Cannot rebuild — module or runtime not ready")
+        print("[Rebuild] ❌ Cannot rebuild — runtime not ready")
         return False
 
     try:
         import ostb._ostb as ostb_mod
         import math as _math
-        m = _curv_module  # shorthand
+        m = _curv_module
 
-        # Update stored parameters
         if new_voltage is not None:
             m._current_voltage = new_voltage
         if new_gain is not None:
@@ -463,23 +559,22 @@ def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float
         voltage = getattr(m, "_current_voltage", 50.0)
         gain = getattr(m, "gain_analog_db", 40.0)
 
-        print(f"[Rebuild] ⏳ Starting rebuild: voltage={voltage}V, gain={gain}dB")
+        print(f"[Rebuild] ⏳ Starting full rebuild: voltage={voltage}V, gain={gain}dB")
 
-        # --- Step 1: Stop acquisition ---
+        # Stop
         try:
             _global_ostb_runtime.stop()
-            print("[Rebuild] ✅ Acquisition stopped")
+            print("[Rebuild] ✅ Stopped")
         except Exception as e:
-            print(f"[Rebuild] ⚠️ Stop warning (may already be stopped): {e}")
+            print(f"[Rebuild] ⚠️ Stop: {e}")
 
-        # --- Step 2: Rebuild waveform with new voltage ---
+        # Rebuild waveform
         new_waveform = ostb_mod.WaveformFactory.make_unipolar(m.center_frequency_hz)
         new_waveform.set_awg(False)
         new_waveform.set_negative_voltage(voltage)
         new_waveform.validate()
-        print(f"[Rebuild] ✅ Waveform built: voltage={voltage}V")
 
-        # --- Step 3: Rebuild full scan sequence ---
+        # Rebuild sequence
         new_seq_builder = (ostb_mod.SequenceBuilder()
                            .set_probe(m.probe)
                            .set_trigger(m.trigger)
@@ -489,11 +584,8 @@ def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float
             start = line_idx
             apodization = [0.0] * m.probe.element_count
             apodization[start: start + m.active_element_count] = [1.0] * m.active_element_count
-
             center_idx = start + m.active_element_count // 2 - (
-                1 if (m.active_element_count % 2 == 0) else 0
-            )
-
+                1 if (m.active_element_count % 2 == 0) else 0)
             azimuth_rad = m.probe.az_angle[center_idx]
             radius_m = m.probe.radius
             rho_m = radius_m + m.focus_depth_m
@@ -526,27 +618,20 @@ def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float
                     .set_rectification(ostb_mod.Rectification.SIGNED)
                     .set_beam_correction(0.0)
                     .build(m.probe.element_count))
-
             new_seq_builder.add_scan(scan)
 
         new_seq = new_seq_builder.build()
-        print(f"[Rebuild] ✅ Sequence built: {m.line_count} scan lines")
+        print(f"[Rebuild] ✅ Sequence built: {m.line_count} lines")
 
-        # --- Step 4: Rebuild AcquisitionConfiguration ---
         new_config = ostb_mod.AcquisitionConfiguration()
         new_config.set_root(m.root)
         new_config.set_sequence(new_seq)
         new_config.set_processing(m.processing)
         new_config.validate()
-        print("[Rebuild] ✅ Configuration validated")
 
-        # --- Step 5: Configure hardware ---
         _global_ostb_runtime.configure(new_config)
-        print(f"[Rebuild] ✅ Hardware configured: voltage={voltage}V, gain={gain}dB")
-
-        # --- Step 6: Restart acquisition ---
         _global_ostb_runtime.start()
-        print(f"[Rebuild] ✅ Acquisition restarted — voltage={voltage}V, gain={gain}dB ACTIVE")
+        print(f"[Rebuild] ✅ Done: voltage={voltage}V, gain={gain}dB")
         _rebuild_lock.release()
         return True
 
@@ -556,6 +641,9 @@ def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float
         import traceback
         traceback.print_exc()
         return False
+
+
+
 
 
 
