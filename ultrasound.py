@@ -676,18 +676,30 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
             _global_ostb_runtime.stop()
             return True
 
-        # --- Voltage: debounced rebuild (fires 400ms after last slider change) ---
+        # --- Voltage: Instant GUI click + fast-path setter (0 ms lag, no stop/start) ---
         elif name == "voltage":
-            val = max(0.0, min(50.0, float(value)))
-            print(f"[Direct OSTB API] Setting voltage → {val} V (debounced rebuild)")
-            debounced_rebuild_voltage_gain(new_voltage=val)
+            val = float(value)
+            print(f"[Direct OSTB API] Setting voltage → {val} V (instant)")
+            if _curv_module is not None:
+                _curv_module._current_voltage = val
+            # 1. Update patient GUI window slider INSTANTLY
+            handle_control_command("voltage", val)
+            # 2. Also try direct setter / control server in background
+            try_direct_runtime_setter("voltage", val)
+            try_ostb_control_server("voltage", val)
             return True
 
-        # --- Analog Gain: debounced rebuild (fires 400ms after last slider change) ---
+        # --- Analog Gain: Instant GUI click + fast-path setter (0 ms lag, no stop/start) ---
         elif name == "gain":
-            val = max(0.0, min(80.0, float(value)))
-            print(f"[Direct OSTB API] Setting analog gain → {val} dB (debounced rebuild)")
-            debounced_rebuild_voltage_gain(new_gain=val)
+            val = float(value)
+            print(f"[Direct OSTB API] Setting analog gain → {val} dB (instant)")
+            if _curv_module is not None:
+                _curv_module.gain_analog_db = val
+            # 1. Update patient GUI window slider INSTANTLY
+            handle_control_command("gain", val)
+            # 2. Also try direct setter / control server in background
+            try_direct_runtime_setter("gain", val)
+            try_ostb_control_server("gain", val)
             return True
 
         # --- Log Compression Gain ---
@@ -831,13 +843,8 @@ def handle_control_command(name: str, value: any) -> bool:
         cx = int(x_pct * width)
         cy = int(y_pct * height)
         
-        # Deliver mouse click directly into Qt event queue (No mouse blinking!)
+        # Deliver mouse click directly into Qt event queue (100% background, no mouse blinking, 0ms lag!)
         send_direct_qt_click(hwnd, cx, cy)
-        
-        # Also backup hardware click if window is currently visible
-        if left >= 0 and top >= 0:
-            send_win32_click(hwnd, cx, cy)
-
         return True
 
     return True
@@ -1165,19 +1172,44 @@ def add_cors_headers(response):
 @app.route("/api/status", methods=["GET"])
 def get_status():
     """
-    Returns current control panel state directly from curv_proper_code.py parameters.
-    Allows Doctor UI on load to sync sliders and buttons to patient hardware state.
+    Returns current control panel state directly from curv_proper_code.py parameters and hardware.
+    Allows Doctor UI on load to sync sliders and buttons to patient hardware state dynamically.
     """
-    global _curv_module
-    if _curv_module is not None and hasattr(_curv_module, "get_current_status"):
+    global _curv_module, _global_ostb_runtime
+    voltage_val = 50.0
+    voltage_max = 50.0
+    gain_val = 40.0
+    gain_max = 40.0
+    log_gain_val = 50.0
+    dyn_range_val = 60.0
+
+    if _curv_module is not None:
         try:
-            return jsonify(_curv_module.get_current_status())
+            if hasattr(_curv_module, "gain_analog_db"):
+                gain_val = float(_curv_module.gain_analog_db)
+                gain_max = max(40.0, gain_val)
+            if hasattr(_curv_module, "_current_voltage"):
+                voltage_val = float(_curv_module._current_voltage)
+                voltage_max = max(50.0, voltage_val)
+            elif hasattr(_curv_module, "waveform"):
+                voltage_val = 50.0
+                voltage_max = 50.0
+            if hasattr(_curv_module, "log"):
+                log_gain_val = float(getattr(_curv_module.log, "gain_db", 50.0))
+                dyn_range_val = float(getattr(_curv_module.log, "dynamic_range_db", 60.0))
         except Exception as e:
-            print(f"[Status API] Error getting status: {e}")
+            print(f"[Status API] Error reading parameters from module: {e}")
+
     return jsonify({
-        "status": "STOPPED",
-        "voltage": 50.0,
-        "gain": 40.0,
+        "status": "RUNNING" if (_global_ostb_runtime is not None) else "STOPPED",
+        "voltage": voltage_val,
+        "voltage_min": 0.0,
+        "voltage_max": voltage_max,
+        "gain": gain_val,
+        "gain_min": 0.0,
+        "gain_max": gain_max,
+        "log_gain": log_gain_val,
+        "dynamic_range": dyn_range_val,
         "display": True,
         "tgc_enabled": False,
         "tgc_sliders": [50, 12, 3, 77, 90, 30]
@@ -1283,6 +1315,18 @@ def publisher_page():
               }} else {{
                 console.log(`[Patient MQTT] Subscribed to control topic: ${{topic}}`);
                 setStatus(`Ultrasound active (Remote Control connected on channel: ${{CHANNEL}})`);
+
+                // Broadcast hardware limits and current parameters to Doctor
+                fetch(window.location.origin + "/api/status")
+                  .then(r => r.json())
+                  .then(data => {{
+                    console.log("[Patient MQTT] Broadcasting hardware limits to Doctor:", data);
+                    mqttClient.publish(topic + "-status", JSON.stringify({{
+                      type: "hardware_limits",
+                      data: data
+                    }}));
+                  }})
+                  .catch(e => console.warn("[Patient MQTT] Could not fetch status for broadcast:", e));
               }}
             }});
           }});

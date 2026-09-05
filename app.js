@@ -32,11 +32,26 @@ function connectDoctorMQTT(appId, channel) {
       
       doctorMqttClient.on("connect", () => {
         console.log(`[Doctor MQTT] Connected to ${url} on topic: ${doctorControlTopic}`);
+        const statusTopic = `${doctorControlTopic}-status`;
+        doctorMqttClient.subscribe(statusTopic, (err) => {
+          if (!err) console.log(`[Doctor MQTT] Subscribed to status topic: ${statusTopic}`);
+        });
         // Flush any queued payloads
         while (pendingMqttPayloads.length > 0) {
           const payload = pendingMqttPayloads.shift();
           doctorMqttClient.publish(doctorControlTopic, payload);
           console.log(`[Doctor MQTT] Flushed queued control to ${doctorControlTopic}:`, payload);
+        }
+      });
+
+      doctorMqttClient.on("message", (topic, message) => {
+        try {
+          const payload = JSON.parse(message.toString());
+          if (payload.type === "hardware_limits" && payload.data) {
+            applyHardwareLimitsToDoctorUI(payload.data);
+          }
+        } catch (e) {
+          console.error("[Doctor MQTT] Error handling status message:", e);
         }
       });
       
@@ -1722,6 +1737,30 @@ if (controlsModal) {
   }
 }
 
+function applyHardwareLimitsToDoctorUI(data) {
+  console.log("[Doctor UI] Applying dynamic hardware limits from patient:", data);
+  if (data.voltage_max !== undefined && voltageSlider) {
+    voltageSlider.max = data.voltage_max;
+    if (data.voltage_min !== undefined) voltageSlider.min = data.voltage_min;
+    if (data.voltage !== undefined) {
+      voltageSlider.value = data.voltage;
+      if (voltageValueInput) voltageValueInput.value = data.voltage;
+    }
+    updateSliderBackground(voltageSlider);
+    console.log(`[Doctor UI] Voltage slider range set: ${voltageSlider.min} - ${voltageSlider.max} V (value: ${voltageSlider.value})`);
+  }
+  if (data.gain_max !== undefined && gainSlider) {
+    gainSlider.max = data.gain_max;
+    if (data.gain_min !== undefined) gainSlider.min = data.gain_min;
+    if (data.gain !== undefined) {
+      gainSlider.value = data.gain;
+      if (gainValueInput) gainValueInput.value = data.gain;
+    }
+    updateSliderBackground(gainSlider);
+    console.log(`[Doctor UI] Gain slider range set: ${gainSlider.min} - ${gainSlider.max} dB (value: ${gainSlider.value})`);
+  }
+}
+
 // Fetch initial parameters directly from curv_proper_code.py to sync Doctor controls
 async function syncDoctorControlsFromPatientState() {
   try {
@@ -1729,18 +1768,7 @@ async function syncDoctorControlsFromPatientState() {
     if (!res.ok) return;
     const data = await res.json();
     console.log("[Doctor UI] Synced state from curv_proper_code.py:", data);
-
-    if (data.voltage !== undefined && voltageSlider && voltageValueInput) {
-      voltageSlider.value = data.voltage;
-      voltageValueInput.value = data.voltage;
-      updateSliderBackground(voltageSlider);
-    }
-
-    if (data.gain !== undefined && gainSlider && gainValueInput) {
-      gainSlider.value = data.gain;
-      gainValueInput.value = data.gain;
-      updateSliderBackground(gainSlider);
-    }
+    applyHardwareLimitsToDoctorUI(data);
 
     if (data.display !== undefined && displayToggle) {
       displayToggle.checked = data.display;
