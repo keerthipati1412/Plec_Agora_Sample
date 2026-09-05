@@ -12,6 +12,7 @@ What it does automatically:
 from __future__ import annotations
 
 import atexit
+import math
 import subprocess
 import sys
 import threading
@@ -417,79 +418,94 @@ except Exception as exc:
     print(f"[ultrasound Hook] OSTB hook info: {exc}")
 
 
-def try_direct_runtime_setter(name: str, value: float) -> bool:
+def _rebuild_configuration(new_voltage: float | None = None, new_gain: float | None = None) -> bool:
     """
-    Tier 1: Try calling a direct setter on the runtime object that works WHILE RUNNING.
-    The NEXUS GUI uses pOEMPA->SetGainAnalog / SetVoltage directly — these are exposed
-    on the runtime as set_gain_analog() / set_voltage() if available.
-    Returns True if succeeded instantly without stopping acquisition.
+    AcquisitionRuntime exposes no incremental voltage/gain setter — its only mutation
+    path is configure(full_configuration). Voltage lives on the single shared `waveform`
+    object referenced by every tx config, so mutating it in place is enough. Gain is baked
+    per-line into each scan at build time and curv_proper_code.py doesn't keep those
+    per-scan objects around, so picking up a new gain means re-running the same per-line
+    txConfig/scan build loop (reusing the probe/geometry state already sitting on the
+    loaded module) and pushing a freshly built sequence via configure(). No stop()/start().
     """
-    global _global_ostb_runtime
-    if _global_ostb_runtime is None:
-        print(f"[FastPath] No runtime captured yet — cannot set {name}={value}")
+    global _curv_module, _global_ostb_runtime
+    if _curv_module is None or _global_ostb_runtime is None:
+        print(f"[Configure] Module or runtime not ready — cannot set voltage={new_voltage} gain={new_gain}")
         return False
+
+    m = _curv_module
     try:
-        r = _global_ostb_runtime
-        candidates = {
-            "gain": ("set_gain_analog", "set_analog_gain", "set_gain"),
-            "voltage": ("set_voltage", "set_negative_voltage", "set_tx_voltage"),
-        }.get(name, ())
-        for method in candidates:
-            if hasattr(r, method):
-                getattr(r, method)(value)
-                print(f"[FastPath] Direct {method}({value}) succeeded — no stop/start!")
-                return True
-        if candidates:
-            methods = [m for m in dir(r) if not m.startswith("__")]
-            print(f"[FastPath] None of {candidates} exist on runtime for '{name}'. "
-                  f"Available runtime methods: {methods}")
+        if new_voltage is not None:
+            m.waveform.set_negative_voltage(float(new_voltage))
+            m.waveform.validate()
+
+        gain_val = float(new_gain) if new_gain is not None else float(m.gain_analog_db)
+
+        seq_builder = (ostb.SequenceBuilder()
+                       .set_probe(m.probe)
+                       .set_trigger(m.trigger)
+                       .set_number_of_frames(m.frame_count))
+
+        for line_idx in range(m.line_count):
+            start = line_idx
+            apodization = [0.0] * m.probe.element_count
+            apodization[start: start + m.active_element_count] = [1.0] * m.active_element_count
+
+            center_idx = start + m.active_element_count // 2 - (
+                1 if (m.active_element_count % 2 == 0) else 0
+            )
+            azimuth_rad = m.probe.az_angle[center_idx]
+            radius_m = m.probe.radius
+            rho_m = radius_m + m.focus_depth_m
+            x_focus_m = rho_m * math.sin(azimuth_rad)
+            z_focus_m = -radius_m + rho_m * math.cos(azimuth_rad)
+
+            tx_config = (ostb.TxConfigBuilder()
+                         .set_apodization(apodization)
+                         .set_source([0.0, 0.0, 0.0])
+                         .set_focus_point([x_focus_m, 0.0, z_focus_m])
+                         .set_tx_with_all_elements(False)
+                         .set_waveform(m.waveform)
+                         .set_speed_of_sound(m.speed_of_sound)
+                         .compute_delays(m.probe)
+                         .build(m.probe))
+
+            scan = (ostb.ScanBuilder()
+                    .set_tx(tx_config)
+                    .set_rx(m.rxConfig)
+                    .set_process_id(0)
+                    .set_scan_id(line_idx)
+                    .set_frame_id(0)
+                    .set_gain_digital(0.0)
+                    .set_gain_analog(gain_val)
+                    .set_start(m.scan_start_s)
+                    .set_range(m.scan_range_s)
+                    .set_time_slot(m.time_slot_seconds)
+                    .set_sample_factor(m.sample_factor)
+                    .set_compression_type(ostb.CompressionType.DECIMATION)
+                    .set_rectification(ostb.Rectification.SIGNED)
+                    .set_beam_correction(0.0)
+                    .build(m.probe.element_count))
+
+            seq_builder.add_scan(scan)
+
+        new_seq = seq_builder.build()
+        m.configuration.set_sequence(new_seq)
+        m.configuration.validate()
+
+        t0 = time.time()
+        _global_ostb_runtime.configure(m.configuration)
+        elapsed_ms = (time.time() - t0) * 1000
+        print(f"[Configure] runtime.configure() took {elapsed_ms:.1f} ms "
+              f"(voltage={new_voltage if new_voltage is not None else 'unchanged'}, gain={gain_val})")
+
+        if new_voltage is not None:
+            m._current_voltage = float(new_voltage)
+        m.gain_analog_db = gain_val
+        return True
     except Exception as e:
-        print(f"[FastPath] Direct setter error for '{name}': {e}")
-    return False
-
-
-def try_ostb_control_server(name: str, value: float) -> bool:
-    """
-    Tier 2: Send command to the OSTB control server at 127.0.0.1:4096.
-    This is the same path the NEXUS GUI uses for real-time parameter changes.
-    Tries multiple protocol formats used by OSTB control servers.
-    Returns True if succeeded instantly without stopping acquisition.
-    """
-    import socket, json as _json
-
-    control_port = 4096
-    # Try different formats — OSTB control server protocol variants
-    payloads_to_try = [
-        _json.dumps({"control": name, "value": value}) + "\n",
-        _json.dumps({"command": name, "value": value}) + "\n",
-        _json.dumps({"type": name, "data": value}) + "\n",
-        f"{name}={value}\n",
-    ]
-
-    for payload in payloads_to_try:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.3)
-            s.connect(("127.0.0.1", control_port))
-            s.sendall(payload.encode("utf-8"))
-            # Try to read response
-            try:
-                resp = s.recv(256).decode("utf-8", errors="ignore").strip()
-                if resp:
-                    print(f"[FastPath] ✅ Control server responded to '{name}'={value}: {resp!r}")
-                    s.close()
-                    return True
-            except Exception:
-                pass
-            s.close()
-            print(f"[FastPath] ✅ Control server accepted '{name}'={value} (no response — OK)")
-            return True
-        except ConnectionRefusedError:
-            print(f"[FastPath] ⚠️ Control server at 127.0.0.1:{control_port} not accepting connections")
-            return False
-        except Exception:
-            continue
-    return False
+        print(f"[Configure] Sequence rebuild/configure failed: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -533,28 +549,22 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
             _global_ostb_runtime.stop()
             return True
 
-        # --- Voltage: call the real hardware runtime setter directly (no GUI click) ---
+        # --- Voltage: rebuild sequence with new voltage baked in, push via configure() ---
         elif name == "voltage":
             val = float(value)
             print(f"[Direct OSTB API] Setting voltage -> {val} V")
-            applied = try_direct_runtime_setter("voltage", val) or try_ostb_control_server("voltage", val)
-            if applied and _curv_module is not None:
-                _curv_module._current_voltage = val
+            applied = _rebuild_configuration(new_voltage=val)
             if not applied:
-                print(f"[Direct OSTB API] ⚠️ No runtime/control-server setter accepted voltage={val}. "
-                      f"Check '[ultrasound Watcher] >>> RUNTIME METHODS' log for the real method name.")
+                print(f"[Direct OSTB API] ⚠️ Failed to apply voltage={val} via configure().")
             return applied
 
-        # --- Analog Gain: call the real hardware runtime setter directly (no GUI click) ---
+        # --- Analog Gain: rebuild sequence with new gain baked in, push via configure() ---
         elif name == "gain":
             val = float(value)
             print(f"[Direct OSTB API] Setting analog gain -> {val} dB")
-            applied = try_direct_runtime_setter("gain", val) or try_ostb_control_server("gain", val)
-            if applied and _curv_module is not None:
-                _curv_module.gain_analog_db = val
+            applied = _rebuild_configuration(new_gain=val)
             if not applied:
-                print(f"[Direct OSTB API] ⚠️ No runtime/control-server setter accepted gain={val}. "
-                      f"Check '[ultrasound Watcher] >>> RUNTIME METHODS' log for the real method name.")
+                print(f"[Direct OSTB API] ⚠️ Failed to apply gain={val} via configure().")
             return applied
 
         # --- Log Compression Gain ---
