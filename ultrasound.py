@@ -12,7 +12,6 @@ What it does automatically:
 from __future__ import annotations
 
 import atexit
-import math
 import subprocess
 import sys
 import threading
@@ -418,12 +417,12 @@ except Exception as exc:
 def _rebuild_configuration(new_voltage: float | None = None, new_gain: float | None = None) -> bool:
     """
     AcquisitionRuntime exposes no incremental voltage/gain setter — its only mutation
-    path is configure(full_configuration). Voltage lives on the single shared `waveform`
-    object referenced by every tx config, so mutating it in place is enough. Gain is baked
-    per-line into each scan at build time and curv_proper_code.py doesn't keep those
-    per-scan objects around, so picking up a new gain means re-running the same per-line
-    txConfig/scan build loop (reusing the probe/geometry state already sitting on the
-    loaded module) and pushing a freshly built sequence via configure(). No stop()/start().
+    path is configure(full_configuration). But Waveform and Scan instances (not just
+    their Builders) both expose live setters (set_negative_voltage / set_gain_analog),
+    so the already-built objects sitting on the loaded curv_proper_code.py module can be
+    mutated directly — no need to recompute probe geometry or rebuild the sequence from
+    scratch. Still requires stop()->configure()->start() to actually push the change to
+    hardware (confirmed: pause()/resume() don't satisfy configure()'s active-state check).
     """
     global _curv_module, _global_ostb_runtime
     if _curv_module is None or _global_ostb_runtime is None:
@@ -437,66 +436,16 @@ def _rebuild_configuration(new_voltage: float | None = None, new_gain: float | N
                 m.waveform.set_negative_voltage(float(new_voltage))
                 m.waveform.validate()
 
-            gain_val = float(new_gain) if new_gain is not None else float(m.gain_analog_db)
+            if new_gain is not None:
+                gain_val = float(new_gain)
+                for scan in m.seq.scans:
+                    scan.set_gain_analog(gain_val)
+                    scan.validate()
+            else:
+                gain_val = float(m.gain_analog_db)
 
-            seq_builder = (ostb.SequenceBuilder()
-                           .set_probe(m.probe)
-                           .set_trigger(m.trigger)
-                           .set_number_of_frames(m.frame_count))
-
-            for line_idx in range(m.line_count):
-                start = line_idx
-                apodization = [0.0] * m.probe.element_count
-                apodization[start: start + m.active_element_count] = [1.0] * m.active_element_count
-
-                center_idx = start + m.active_element_count // 2 - (
-                    1 if (m.active_element_count % 2 == 0) else 0
-                )
-                azimuth_rad = m.probe.az_angle[center_idx]
-                radius_m = m.probe.radius
-                rho_m = radius_m + m.focus_depth_m
-                x_focus_m = rho_m * math.sin(azimuth_rad)
-                z_focus_m = -radius_m + rho_m * math.cos(azimuth_rad)
-
-                tx_config = (ostb.TxConfigBuilder()
-                             .set_apodization(apodization)
-                             .set_source([0.0, 0.0, 0.0])
-                             .set_focus_point([x_focus_m, 0.0, z_focus_m])
-                             .set_tx_with_all_elements(False)
-                             .set_waveform(m.waveform)
-                             .set_speed_of_sound(m.speed_of_sound)
-                             .compute_delays(m.probe)
-                             .build(m.probe))
-
-                scan = (ostb.ScanBuilder()
-                        .set_tx(tx_config)
-                        .set_rx(m.rxConfig)
-                        .set_process_id(0)
-                        .set_scan_id(line_idx)
-                        .set_frame_id(0)
-                        .set_gain_digital(0.0)
-                        .set_gain_analog(gain_val)
-                        .set_start(m.scan_start_s)
-                        .set_range(m.scan_range_s)
-                        .set_time_slot(m.time_slot_seconds)
-                        .set_sample_factor(m.sample_factor)
-                        .set_compression_type(ostb.CompressionType.DECIMATION)
-                        .set_rectification(ostb.Rectification.SIGNED)
-                        .set_beam_correction(0.0)
-                        .build(m.probe.element_count))
-
-                seq_builder.add_scan(scan)
-
-            new_seq = seq_builder.build()
-            m.configuration.set_sequence(new_seq)
             m.configuration.validate()
 
-            # pause()/resume() do NOT satisfy configure()'s "must not be called while
-            # acquisition is active" check on this hardware (confirmed: configure() still
-            # throws right after a successful pause()) — stop()/start() is the only thing
-            # that does. The sequence is already fully built above though, so the
-            # hardware-facing window here is just stop -> configure -> start, not the whole
-            # rebuild — should be far shorter than the original stop/build/configure/start.
             r = _global_ostb_runtime
             t0 = time.time()
             r.stop()
@@ -518,14 +467,6 @@ def _rebuild_configuration(new_voltage: float | None = None, new_gain: float | N
         except Exception as e:
             print(f"[Configure] Sequence rebuild/configure failed: {e}")
             return False
-
-
-# ---------------------------------------------------------------------------
-# Note: Hardware stop/start rebuild sequence has been permanently removed.
-# All parameter updates (voltage, gain, log_gain, dynamic_range, display)
-# execute directly in real-time via Qt event injection and OSTB control server
-# WITHOUT ever stopping acquisition, guaranteeing zero lag and continuous streaming!
-# ---------------------------------------------------------------------------
 
 
 
