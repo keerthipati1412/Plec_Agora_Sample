@@ -440,7 +440,7 @@ def _rebuild_configuration(new_voltage: float | None = None, new_gain: float | N
                 gain_val = float(new_gain)
                 for scan in m.seq.scans:
                     scan.set_gain_analog(gain_val)
-                    scan.validate()
+                    scan.validate(m.probe.element_count)
             else:
                 gain_val = float(m.gain_analog_db)
 
