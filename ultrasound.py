@@ -389,40 +389,46 @@ except Exception as exc:
 def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float = None) -> bool:
     """
     Rebuilds the waveform, TX configs, scans, sequence and full AcquisitionConfiguration
-    from scratch using the current _curv_module parameters — then calls runtime.configure()
-    with the freshly-built configuration so hardware actually sees the new values.
+    from scratch, then reconfigures hardware using stop → configure → start sequence.
 
-    This is necessary because OSTB Builder objects serialize their values at .build() time —
-    mutating Python attributes after .build() has no effect on already-built C++ objects.
+    OSTB hardware requires: stop() → configure(new_config) → start() to apply param changes.
     """
     global _global_ostb_runtime, _curv_module
     if _curv_module is None or _global_ostb_runtime is None:
-        print("[Rebuild] Cannot rebuild — module or runtime not ready")
+        print("[Rebuild] ❌ Cannot rebuild — module or runtime not ready")
         return False
 
     try:
         import ostb._ostb as ostb_mod
+        import math as _math
         m = _curv_module  # shorthand
 
         # Update stored parameters
         if new_voltage is not None:
-            m.gain_analog_db = getattr(m, "gain_analog_db", 40.0)
+            m._current_voltage = new_voltage
         if new_gain is not None:
             m.gain_analog_db = new_gain
 
-        voltage = new_voltage if new_voltage is not None else getattr(m, "_current_voltage", 50.0)
-        m._current_voltage = voltage
-        gain = m.gain_analog_db
+        voltage = getattr(m, "_current_voltage", 50.0)
+        gain = getattr(m, "gain_analog_db", 40.0)
 
-        print(f"[Rebuild] Rebuilding configuration: voltage={voltage}V, gain={gain}dB")
+        print(f"[Rebuild] ⏳ Starting rebuild: voltage={voltage}V, gain={gain}dB")
 
-        # Rebuild waveform with new voltage
+        # --- Step 1: Stop acquisition ---
+        try:
+            _global_ostb_runtime.stop()
+            print("[Rebuild] ✅ Acquisition stopped")
+        except Exception as e:
+            print(f"[Rebuild] ⚠️ Stop warning (may already be stopped): {e}")
+
+        # --- Step 2: Rebuild waveform with new voltage ---
         new_waveform = ostb_mod.WaveformFactory.make_unipolar(m.center_frequency_hz)
         new_waveform.set_awg(False)
         new_waveform.set_negative_voltage(voltage)
         new_waveform.validate()
+        print(f"[Rebuild] ✅ Waveform built: voltage={voltage}V")
 
-        # Rebuild sequence with new waveform and gain
+        # --- Step 3: Rebuild full scan sequence ---
         new_seq_builder = (ostb_mod.SequenceBuilder()
                            .set_probe(m.probe)
                            .set_trigger(m.trigger)
@@ -437,12 +443,11 @@ def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float
                 1 if (m.active_element_count % 2 == 0) else 0
             )
 
-            import math
             azimuth_rad = m.probe.az_angle[center_idx]
             radius_m = m.probe.radius
             rho_m = radius_m + m.focus_depth_m
-            x_focus_m = rho_m * math.sin(azimuth_rad)
-            z_focus_m = -radius_m + rho_m * math.cos(azimuth_rad)
+            x_focus_m = rho_m * _math.sin(azimuth_rad)
+            z_focus_m = -radius_m + rho_m * _math.cos(azimuth_rad)
 
             tx_config = (ostb_mod.TxConfigBuilder()
                          .set_apodization(apodization)
@@ -474,21 +479,29 @@ def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float
             new_seq_builder.add_scan(scan)
 
         new_seq = new_seq_builder.build()
+        print(f"[Rebuild] ✅ Sequence built: {m.line_count} scan lines")
 
-        # Rebuild configuration with new sequence
+        # --- Step 4: Rebuild AcquisitionConfiguration ---
         new_config = ostb_mod.AcquisitionConfiguration()
         new_config.set_root(m.root)
         new_config.set_sequence(new_seq)
         new_config.set_processing(m.processing)
         new_config.validate()
+        print("[Rebuild] ✅ Configuration validated")
 
-        # Apply new configuration to hardware
+        # --- Step 5: Configure hardware ---
         _global_ostb_runtime.configure(new_config)
-        print(f"[Rebuild] ✅ Hardware reconfigured: voltage={voltage}V, gain={gain}dB")
+        print(f"[Rebuild] ✅ Hardware configured: voltage={voltage}V, gain={gain}dB")
+
+        # --- Step 6: Restart acquisition ---
+        _global_ostb_runtime.start()
+        print(f"[Rebuild] ✅ Acquisition restarted — voltage={voltage}V, gain={gain}dB ACTIVE")
         return True
 
     except Exception as e:
-        print(f"[Rebuild] ❌ Error rebuilding configuration: {e}")
+        print(f"[Rebuild] ❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
