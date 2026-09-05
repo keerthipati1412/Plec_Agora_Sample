@@ -176,8 +176,9 @@ def _start_mqtt_subscriber() -> None:
 
 def find_opensonics_control_window() -> int:
     """
-    Finds the NEXUS / OpenSonics Control Panel window handle (hwnd).
-    Explicitly targets window title 'NEXUS' (class 'Qt6102QWindowOwnDCIcon').
+    Finds the OpenSonics / NEXUS Control Panel window handle (hwnd).
+    Matches the window with 'Acquisition' and 'Signal Controls' panels,
+    even when the title bar text is empty or untitled.
     """
     try:
         import win32gui
@@ -186,22 +187,29 @@ def find_opensonics_control_window() -> int:
 
     control_hwnd = [0]
     render_hwnd = [0]
+    all_qt = []
 
     def enum_cb(hwnd, _):
-        if not win32gui.IsWindow(hwnd):
+        if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
             return True
-        title = win32gui.GetWindowText(hwnd)
+        title = win32gui.GetWindowText(hwnd).strip()
         cls_name = win32gui.GetClassName(hwnd)
+        rect = win32gui.GetWindowRect(hwnd)
+        w = rect[2] - rect[0]
+        h = rect[3] - rect[1]
 
-        # Match exact NEXUS control panel window
-        if title == "NEXUS":
-            control_hwnd[0] = hwnd
-            return False
-        elif "Image" in title or "Focused" in title or "B-Mode" in title:
-            render_hwnd[0] = hwnd
-        elif ("Qt6" in cls_name or "Qt5" in cls_name) and title and title not in ["Launcher", "_q_titlebar"]:
-            if not control_hwnd[0]:
+        # Match Qt control panel window
+        if "Qt" in cls_name or "QWindow" in cls_name:
+            all_qt.append(f"hwnd={hwnd} title='{title}' class='{cls_name}' size=({w}x{h})")
+            if title == "NEXUS" or title == "OpenSonics" or "Control" in title:
                 control_hwnd[0] = hwnd
+                return False
+            elif "B-Mode" in title or "Focused" in title or "Image" in title:
+                render_hwnd[0] = hwnd
+            elif w >= 350 and h >= 250 and title not in ["Launcher", "_q_titlebar"]:
+                # OpenSonics GUI window often has empty title bar
+                if not control_hwnd[0]:
+                    control_hwnd[0] = hwnd
         return True
 
     try:
@@ -210,6 +218,13 @@ def find_opensonics_control_window() -> int:
         pass
 
     target = control_hwnd[0] or render_hwnd[0] or 0
+    if target:
+        title = win32gui.GetWindowText(target).strip()
+        cls = win32gui.GetClassName(target)
+        rect = win32gui.GetWindowRect(target)
+        print(f"[Remote Control] Selected target window hwnd={target} title='{title}' class='{cls}' rect={rect}")
+    else:
+        print(f"[Remote Control] Warning: Control window not found! Visible Qt windows: {all_qt}")
     return target
 
 
@@ -583,7 +598,8 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
 
 def send_direct_qt_click(hwnd: int, cx: int, cy: int) -> None:
     """
-    Sends direct Win32 WM_LBUTTONDOWN and WM_LBUTTONUP messages directly to Qt's event queue.
+    Sends direct Win32 WM_LBUTTONDOWN, MOUSEMOVE, and WM_LBUTTONUP messages directly to Qt's event queue.
+    Dispatches to both top-level window and child control under coordinates.
     Does NOT move the physical cursor or blink the mouse pointer on screen.
     """
     import win32gui
@@ -592,24 +608,38 @@ def send_direct_qt_click(hwnd: int, cx: int, cy: int) -> None:
 
     try:
         lParam = win32api.MAKELONG(int(cx), int(cy))
-        print(f"[Remote Control Qt] Posting WM_LBUTTONDOWN/UP to hwnd={hwnd} at client ({cx}, {cy})")
-        win32gui.PostMessage(hwnd, win32con.WM_ACTIVATE, win32con.WA_ACTIVE, 0)
-        win32gui.PostMessage(hwnd, win32con.WM_MOUSEMOVE, 0, lParam)
-        win32gui.PostMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lParam)
-        time.sleep(0.04)
-        win32gui.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, lParam)
+
+        # Check for child control under coordinates
+        child = win32gui.RealChildWindowFromPoint(hwnd, (int(cx), int(cy)))
+        targets = [hwnd]
+        if child and child != hwnd:
+            targets.append(child)
+
+        for target in targets:
+            win32gui.PostMessage(target, win32con.WM_ACTIVATE, win32con.WA_ACTIVE, 0)
+            win32gui.PostMessage(target, win32con.WM_MOUSEMOVE, 0, lParam)
+            win32gui.PostMessage(target, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lParam)
+            time.sleep(0.01)
+            win32gui.PostMessage(target, win32con.WM_MOUSEMOVE, win32con.MK_LBUTTON, lParam)
+            time.sleep(0.01)
+            win32gui.PostMessage(target, win32con.WM_LBUTTONUP, 0, lParam)
+
+        print(f"[Remote Control Qt] Dispatched mouse click-drag to {len(targets)} targets at client ({cx}, {cy})")
     except Exception as e:
         print(f"[Remote Control Qt] PostMessage error: {e}")
 
 
 def handle_control_command(name: str, value: any) -> bool:
     """
-    Handles control commands from doctor side and delivers them directly into NEXUS via PostMessage & PySonics socket.
-    Coordinates calibrated to NEXUS window layout (640x480 ratio):
-    - Start Button: x_pct=0.25, y_pct=0.16 (cy=68)
-    - Freeze Button: x_pct=0.25, y_pct=0.25 (cy=108)
-    - Voltage Slider: y_pct=0.42
-    - Analog Gain Slider: y_pct=0.58
+    Handles control commands from doctor side and delivers them directly into the
+    OpenSonics Control Panel window via PostMessage.
+    Calibrated exactly to the OpenSonics Acquisition & Signal Controls layout:
+    - Stop Button: x_pct=0.245, y_pct=0.288
+    - Freeze Button: x_pct=0.245, y_pct=0.390
+    - Voltage Slider: track spans x=0.078 to 0.420, y_pct=0.564
+    - Analog Gain Slider: track spans x=0.078 to 0.420, y_pct=0.703
+    - Display Toggle: x_pct=0.650, y_pct=0.765
+    - TGC Toggle: x_pct=0.650, y_pct=0.262
     """
     print(f"[Remote Control API] Processing command: '{name}'={value}")
 
@@ -626,65 +656,80 @@ def handle_control_command(name: str, value: any) -> bool:
         return True
 
     rect = win32gui.GetWindowRect(hwnd)
-    left, top, right, bottom = rect
-    width = max(500, right - left)
-    height = max(380, bottom - top)
+    win_left, win_top, win_right, win_bottom = rect
+    win_w = max(400, win_right - win_left)
+    win_h = max(300, win_bottom - win_top)
 
     x_pct = None
     y_pct = None
 
     if name == "start":
-        x_pct, y_pct = 0.25, 0.16
-        # Send Space/Enter keypresses directly into Qt window
+        # Stop / Start button (blue button in Acquisition panel)
+        x_pct, y_pct = 0.245, 0.288
         try:
             win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_SPACE, 0)
-            time.sleep(0.03)
+            time.sleep(0.02)
             win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_SPACE, 0)
-            win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
-            time.sleep(0.03)
-            win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
         except Exception:
             pass
 
     elif name == "freeze":
-        x_pct, y_pct = 0.25, 0.25
+        # Freeze button (white button with snowflake in Acquisition panel)
+        x_pct, y_pct = 0.245, 0.390
         try:
             win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_SPACE, 0)
-            time.sleep(0.03)
+            time.sleep(0.02)
             win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_SPACE, 0)
         except Exception:
             pass
+
     elif name == "voltage":
         val = float(value)
-        x_pct = 0.12 + (val / 50.0) * 0.26
-        y_pct = 0.42
+        # Track spans from x=0.078 to x=0.420; center y=0.564
+        max_v = 50.0
+        pct = max(0.0, min(1.0, val / max_v))
+        x_pct = 0.078 + pct * (0.420 - 0.078)
+        y_pct = 0.564
+
     elif name == "gain":
         val = float(value)
-        x_pct = 0.12 + (val / 40.0) * 0.26
-        y_pct = 0.58
+        # Track spans from x=0.078 to x=0.420; center y=0.703
+        max_g = 40.0
+        pct = max(0.0, min(1.0, val / max_g))
+        x_pct = 0.078 + pct * (0.420 - 0.078)
+        y_pct = 0.703
+
     elif name == "display":
-        x_pct, y_pct = 0.64, 0.70
+        # Display toggle switch
+        x_pct, y_pct = 0.650, 0.765
+
     elif name == "tgc_toggle":
-        x_pct, y_pct = 0.64, 0.18
+        # TGC toggle switch
+        x_pct, y_pct = 0.650, 0.262
+
     elif name.startswith("tgc_slider_"):
         try:
             slider_idx = int(name.split("_")[-1]) - 1
             val = float(value)
-            x_pct = 0.54 + (slider_idx * 0.07)
-            y_pct = 0.62 - (val / 100.0) * 0.34
+            # 6 TGC vertical sliders span x=0.56 to x=0.94; y spans 0.36 to 0.68
+            x_pct = 0.56 + (slider_idx * 0.076)
+            y_pct = 0.68 - (val / 100.0) * 0.32
         except ValueError:
             return False
+
     elif name == "save_setup":
-        x_pct, y_pct = 0.62, 0.83
+        x_pct, y_pct = 0.63, 0.88
     elif name == "advanced":
-        x_pct, y_pct = 0.84, 0.83
+        x_pct, y_pct = 0.85, 0.88
 
     if x_pct is not None and y_pct is not None:
-        cx = int(x_pct * width)
-        cy = int(y_pct * height)
+        screen_x = win_left + int(x_pct * win_w)
+        screen_y = win_top + int(y_pct * win_h)
+        cx, cy = win32gui.ScreenToClient(hwnd, (screen_x, screen_y))
         
         # Deliver mouse click directly into Qt event queue (100% background, no mouse blinking, 0ms lag!)
         send_direct_qt_click(hwnd, cx, cy)
+        print(f"[Remote Control] Clicked '{name}' at ({x_pct:.3f}, {y_pct:.3f}) -> client ({cx}, {cy})")
         return True
 
     return True
