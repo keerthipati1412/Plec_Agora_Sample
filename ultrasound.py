@@ -426,21 +426,23 @@ def try_direct_runtime_setter(name: str, value: float) -> bool:
     """
     global _global_ostb_runtime
     if _global_ostb_runtime is None:
+        print(f"[FastPath] No runtime captured yet — cannot set {name}={value}")
         return False
     try:
         r = _global_ostb_runtime
-        if name == "gain":
-            for method in ("set_gain_analog", "set_analog_gain", "set_gain"):
-                if hasattr(r, method):
-                    getattr(r, method)(value)
-                    print(f"[FastPath] ✅ Direct {method}({value}) succeeded — no stop/start!")
-                    return True
-        elif name == "voltage":
-            for method in ("set_voltage", "set_negative_voltage", "set_tx_voltage"):
-                if hasattr(r, method):
-                    getattr(r, method)(value)
-                    print(f"[FastPath] ✅ Direct {method}({value}) succeeded — no stop/start!")
-                    return True
+        candidates = {
+            "gain": ("set_gain_analog", "set_analog_gain", "set_gain"),
+            "voltage": ("set_voltage", "set_negative_voltage", "set_tx_voltage"),
+        }.get(name, ())
+        for method in candidates:
+            if hasattr(r, method):
+                getattr(r, method)(value)
+                print(f"[FastPath] Direct {method}({value}) succeeded — no stop/start!")
+                return True
+        if candidates:
+            methods = [m for m in dir(r) if not m.startswith("__")]
+            print(f"[FastPath] None of {candidates} exist on runtime for '{name}'. "
+                  f"Available runtime methods: {methods}")
     except Exception as e:
         print(f"[FastPath] Direct setter error for '{name}': {e}")
     return False
@@ -531,31 +533,29 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
             _global_ostb_runtime.stop()
             return True
 
-        # --- Voltage: Instant GUI click + fast-path setter (0 ms lag, no stop/start) ---
+        # --- Voltage: call the real hardware runtime setter directly (no GUI click) ---
         elif name == "voltage":
             val = float(value)
-            print(f"[Direct OSTB API] Setting voltage → {val} V (instant)")
-            if _curv_module is not None:
+            print(f"[Direct OSTB API] Setting voltage -> {val} V")
+            applied = try_direct_runtime_setter("voltage", val) or try_ostb_control_server("voltage", val)
+            if applied and _curv_module is not None:
                 _curv_module._current_voltage = val
-            # 1. Update patient GUI window slider INSTANTLY
-            handle_control_command("voltage", val)
-            # 2. Also try direct setter / control server in background
-            try_direct_runtime_setter("voltage", val)
-            try_ostb_control_server("voltage", val)
-            return True
+            if not applied:
+                print(f"[Direct OSTB API] ⚠️ No runtime/control-server setter accepted voltage={val}. "
+                      f"Check '[ultrasound Watcher] >>> RUNTIME METHODS' log for the real method name.")
+            return applied
 
-        # --- Analog Gain: Instant GUI click + fast-path setter (0 ms lag, no stop/start) ---
+        # --- Analog Gain: call the real hardware runtime setter directly (no GUI click) ---
         elif name == "gain":
             val = float(value)
-            print(f"[Direct OSTB API] Setting analog gain → {val} dB (instant)")
-            if _curv_module is not None:
+            print(f"[Direct OSTB API] Setting analog gain -> {val} dB")
+            applied = try_direct_runtime_setter("gain", val) or try_ostb_control_server("gain", val)
+            if applied and _curv_module is not None:
                 _curv_module.gain_analog_db = val
-            # 1. Update patient GUI window slider INSTANTLY
-            handle_control_command("gain", val)
-            # 2. Also try direct setter / control server in background
-            try_direct_runtime_setter("gain", val)
-            try_ostb_control_server("gain", val)
-            return True
+            if not applied:
+                print(f"[Direct OSTB API] ⚠️ No runtime/control-server setter accepted gain={val}. "
+                      f"Check '[ultrasound Watcher] >>> RUNTIME METHODS' log for the real method name.")
+            return applied
 
         # --- Log Compression Gain ---
         elif name == "log_gain":
