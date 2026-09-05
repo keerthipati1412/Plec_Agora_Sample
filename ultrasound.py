@@ -411,32 +411,6 @@ try:
             print("[ultrasound Hook] Intercepted save_acquisition_archive_hdf5() — skipping HDF5 save for streaming mode!")
         ostb.save_acquisition_archive_hdf5 = _hooked_save
 
-    # Hook 6: Log the control socket identity once the control server starts. The
-    # embedded GUI (run_controller runs in-process via Hook 2) most likely calls the
-    # engine directly rather than over this socket, so this is probably a separate
-    # external-control channel — worth probing directly instead of packet-sniffing
-    # the in-process GUI, which would show nothing.
-    _orig_start_control_server = ostb.AcquisitionRuntime.start_control_server
-    def _hooked_start_control_server(self, *args, **kwargs):
-        # Probe: force a TCP address before starting, to see whether this socket is a
-        # real reachable endpoint or an in-process-only bus (e.g. ZMQ inproc) that just
-        # ignores/rejects this. If a listener shows up on this port afterward, it's real.
-        try:
-            self.set_control_socket_name("tcp://127.0.0.1:6001")
-            print("[ultrasound Hook] Requested control_socket_name = tcp://127.0.0.1:6001")
-        except Exception as e:
-            print(f"[ultrasound Hook] set_control_socket_name('tcp://127.0.0.1:6001') rejected: {e}")
-
-        result = _orig_start_control_server(self, *args, **kwargs)
-        try:
-            name = self.control_socket_name
-            name = name() if callable(name) else name
-            print(f"[ultrasound Hook] Control server started — control_socket_name: {name!r}")
-        except Exception as e:
-            print(f"[ultrasound Hook] Could not read control_socket_name: {e}")
-        return result
-    ostb.AcquisitionRuntime.start_control_server = _hooked_start_control_server
-
 except Exception as exc:
     print(f"[ultrasound Hook] OSTB hook info: {exc}")
 
