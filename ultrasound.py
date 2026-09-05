@@ -491,13 +491,16 @@ def _rebuild_configuration(new_voltage: float | None = None, new_gain: float | N
             m.configuration.set_sequence(new_seq)
             m.configuration.validate()
 
-            # configure() errors with "must not be called while acquisition is active" —
-            # pause()/resume() should be much lighter than stop()/start() (no FPGA/ring-buffer
-            # reset), so bracket just the configure() call with them instead.
+            # pause()/resume() do NOT satisfy configure()'s "must not be called while
+            # acquisition is active" check on this hardware (confirmed: configure() still
+            # throws right after a successful pause()) — stop()/start() is the only thing
+            # that does. The sequence is already fully built above though, so the
+            # hardware-facing window here is just stop -> configure -> start, not the whole
+            # rebuild — should be far shorter than the original stop/build/configure/start.
             r = _global_ostb_runtime
             t0 = time.time()
-            r.pause()
-            print(f"[Configure] pause() took {(time.time() - t0) * 1000:.1f} ms")
+            r.stop()
+            print(f"[Configure] stop() took {(time.time() - t0) * 1000:.1f} ms")
             try:
                 t0 = time.time()
                 r.configure(m.configuration)
@@ -505,8 +508,8 @@ def _rebuild_configuration(new_voltage: float | None = None, new_gain: float | N
                       f"(voltage={new_voltage if new_voltage is not None else 'unchanged'}, gain={gain_val})")
             finally:
                 t0 = time.time()
-                r.resume()
-                print(f"[Configure] resume() took {(time.time() - t0) * 1000:.1f} ms")
+                r.start()
+                print(f"[Configure] start() took {(time.time() - t0) * 1000:.1f} ms")
 
             if new_voltage is not None:
                 m._current_voltage = float(new_voltage)
