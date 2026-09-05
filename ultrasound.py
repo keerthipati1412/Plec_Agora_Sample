@@ -104,12 +104,9 @@ MQTT_BROKERS = [
     ("broker.emqx.io", 1883),
 ]
 
-# --- Rebuild concurrency control ---
-_rebuild_lock = threading.Lock()           # Prevents concurrent rebuilds
-_rebuild_timer: threading.Timer | None = None   # Debounce timer
-_pending_voltage: float | None = None      # Latest pending voltage value
-_pending_gain: float | None = None         # Latest pending gain value
-_pending_lock = threading.Lock()           # Protects pending values
+# Serializes pause()/configure()/resume() cycles — concurrent MQTT deliveries
+# (e.g. duplicate messages) must never race on the same runtime state machine.
+_rebuild_lock = threading.Lock()
 
 
 def _start_mqtt_subscriber() -> None:
@@ -434,89 +431,90 @@ def _rebuild_configuration(new_voltage: float | None = None, new_gain: float | N
         return False
 
     m = _curv_module
-    try:
-        if new_voltage is not None:
-            m.waveform.set_negative_voltage(float(new_voltage))
-            m.waveform.validate()
-
-        gain_val = float(new_gain) if new_gain is not None else float(m.gain_analog_db)
-
-        seq_builder = (ostb.SequenceBuilder()
-                       .set_probe(m.probe)
-                       .set_trigger(m.trigger)
-                       .set_number_of_frames(m.frame_count))
-
-        for line_idx in range(m.line_count):
-            start = line_idx
-            apodization = [0.0] * m.probe.element_count
-            apodization[start: start + m.active_element_count] = [1.0] * m.active_element_count
-
-            center_idx = start + m.active_element_count // 2 - (
-                1 if (m.active_element_count % 2 == 0) else 0
-            )
-            azimuth_rad = m.probe.az_angle[center_idx]
-            radius_m = m.probe.radius
-            rho_m = radius_m + m.focus_depth_m
-            x_focus_m = rho_m * math.sin(azimuth_rad)
-            z_focus_m = -radius_m + rho_m * math.cos(azimuth_rad)
-
-            tx_config = (ostb.TxConfigBuilder()
-                         .set_apodization(apodization)
-                         .set_source([0.0, 0.0, 0.0])
-                         .set_focus_point([x_focus_m, 0.0, z_focus_m])
-                         .set_tx_with_all_elements(False)
-                         .set_waveform(m.waveform)
-                         .set_speed_of_sound(m.speed_of_sound)
-                         .compute_delays(m.probe)
-                         .build(m.probe))
-
-            scan = (ostb.ScanBuilder()
-                    .set_tx(tx_config)
-                    .set_rx(m.rxConfig)
-                    .set_process_id(0)
-                    .set_scan_id(line_idx)
-                    .set_frame_id(0)
-                    .set_gain_digital(0.0)
-                    .set_gain_analog(gain_val)
-                    .set_start(m.scan_start_s)
-                    .set_range(m.scan_range_s)
-                    .set_time_slot(m.time_slot_seconds)
-                    .set_sample_factor(m.sample_factor)
-                    .set_compression_type(ostb.CompressionType.DECIMATION)
-                    .set_rectification(ostb.Rectification.SIGNED)
-                    .set_beam_correction(0.0)
-                    .build(m.probe.element_count))
-
-            seq_builder.add_scan(scan)
-
-        new_seq = seq_builder.build()
-        m.configuration.set_sequence(new_seq)
-        m.configuration.validate()
-
-        # configure() errors with "must not be called while acquisition is active" —
-        # pause()/resume() should be much lighter than stop()/start() (no FPGA/ring-buffer
-        # reset), so bracket just the configure() call with them instead.
-        r = _global_ostb_runtime
-        t0 = time.time()
-        r.pause()
-        print(f"[Configure] pause() took {(time.time() - t0) * 1000:.1f} ms")
+    with _rebuild_lock:
         try:
-            t0 = time.time()
-            r.configure(m.configuration)
-            print(f"[Configure] configure() took {(time.time() - t0) * 1000:.1f} ms "
-                  f"(voltage={new_voltage if new_voltage is not None else 'unchanged'}, gain={gain_val})")
-        finally:
-            t0 = time.time()
-            r.resume()
-            print(f"[Configure] resume() took {(time.time() - t0) * 1000:.1f} ms")
+            if new_voltage is not None:
+                m.waveform.set_negative_voltage(float(new_voltage))
+                m.waveform.validate()
 
-        if new_voltage is not None:
-            m._current_voltage = float(new_voltage)
-        m.gain_analog_db = gain_val
-        return True
-    except Exception as e:
-        print(f"[Configure] Sequence rebuild/configure failed: {e}")
-        return False
+            gain_val = float(new_gain) if new_gain is not None else float(m.gain_analog_db)
+
+            seq_builder = (ostb.SequenceBuilder()
+                           .set_probe(m.probe)
+                           .set_trigger(m.trigger)
+                           .set_number_of_frames(m.frame_count))
+
+            for line_idx in range(m.line_count):
+                start = line_idx
+                apodization = [0.0] * m.probe.element_count
+                apodization[start: start + m.active_element_count] = [1.0] * m.active_element_count
+
+                center_idx = start + m.active_element_count // 2 - (
+                    1 if (m.active_element_count % 2 == 0) else 0
+                )
+                azimuth_rad = m.probe.az_angle[center_idx]
+                radius_m = m.probe.radius
+                rho_m = radius_m + m.focus_depth_m
+                x_focus_m = rho_m * math.sin(azimuth_rad)
+                z_focus_m = -radius_m + rho_m * math.cos(azimuth_rad)
+
+                tx_config = (ostb.TxConfigBuilder()
+                             .set_apodization(apodization)
+                             .set_source([0.0, 0.0, 0.0])
+                             .set_focus_point([x_focus_m, 0.0, z_focus_m])
+                             .set_tx_with_all_elements(False)
+                             .set_waveform(m.waveform)
+                             .set_speed_of_sound(m.speed_of_sound)
+                             .compute_delays(m.probe)
+                             .build(m.probe))
+
+                scan = (ostb.ScanBuilder()
+                        .set_tx(tx_config)
+                        .set_rx(m.rxConfig)
+                        .set_process_id(0)
+                        .set_scan_id(line_idx)
+                        .set_frame_id(0)
+                        .set_gain_digital(0.0)
+                        .set_gain_analog(gain_val)
+                        .set_start(m.scan_start_s)
+                        .set_range(m.scan_range_s)
+                        .set_time_slot(m.time_slot_seconds)
+                        .set_sample_factor(m.sample_factor)
+                        .set_compression_type(ostb.CompressionType.DECIMATION)
+                        .set_rectification(ostb.Rectification.SIGNED)
+                        .set_beam_correction(0.0)
+                        .build(m.probe.element_count))
+
+                seq_builder.add_scan(scan)
+
+            new_seq = seq_builder.build()
+            m.configuration.set_sequence(new_seq)
+            m.configuration.validate()
+
+            # configure() errors with "must not be called while acquisition is active" —
+            # pause()/resume() should be much lighter than stop()/start() (no FPGA/ring-buffer
+            # reset), so bracket just the configure() call with them instead.
+            r = _global_ostb_runtime
+            t0 = time.time()
+            r.pause()
+            print(f"[Configure] pause() took {(time.time() - t0) * 1000:.1f} ms")
+            try:
+                t0 = time.time()
+                r.configure(m.configuration)
+                print(f"[Configure] configure() took {(time.time() - t0) * 1000:.1f} ms "
+                      f"(voltage={new_voltage if new_voltage is not None else 'unchanged'}, gain={gain_val})")
+            finally:
+                t0 = time.time()
+                r.resume()
+                print(f"[Configure] resume() took {(time.time() - t0) * 1000:.1f} ms")
+
+            if new_voltage is not None:
+                m._current_voltage = float(new_voltage)
+            m.gain_analog_db = gain_val
+            return True
+        except Exception as e:
+            print(f"[Configure] Sequence rebuild/configure failed: {e}")
+            return False
 
 
 # ---------------------------------------------------------------------------
