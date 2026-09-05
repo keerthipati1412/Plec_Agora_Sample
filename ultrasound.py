@@ -103,6 +103,13 @@ MQTT_BROKERS = [
     ("broker.emqx.io", 1883),
 ]
 
+# --- Rebuild concurrency control ---
+_rebuild_lock = threading.Lock()           # Prevents concurrent rebuilds
+_rebuild_timer: threading.Timer | None = None   # Debounce timer
+_pending_voltage: float | None = None      # Latest pending voltage value
+_pending_gain: float | None = None         # Latest pending gain value
+_pending_lock = threading.Lock()           # Protects pending values
+
 
 def _start_mqtt_subscriber() -> None:
     """
@@ -129,6 +136,12 @@ def _start_mqtt_subscriber() -> None:
                 payload = json.loads(msg.payload.decode())
                 control = payload.get("control")
                 value = payload.get("value")
+                # Skip voltage/gain/display — patient browser MQTT already delivers
+                # these to /api/remote-input, avoiding double rebuild
+                if control in ("voltage", "gain", "log_gain", "dynamic_range", "display",
+                               "tgc_toggle", "tgc_slider_1", "tgc_slider_2", "tgc_slider_3",
+                               "tgc_slider_4", "tgc_slider_5", "tgc_slider_6"):
+                    return
                 print(f"[MQTT] ✅ Received from {broker_host}: {control} = {value}")
                 if control:
                     execute_direct_runtime_command(control, value)
@@ -386,6 +399,37 @@ except Exception as exc:
     print(f"[ultrasound Hook] OSTB hook info: {exc}")
 
 
+def debounced_rebuild_voltage_gain(new_voltage: float = None, new_gain: float = None,
+                                   delay_s: float = 0.4) -> None:
+    """
+    Schedules a rebuild after `delay_s` seconds. If called again before the timer fires,
+    the previous timer is cancelled and the new value is used (debounce).
+    This prevents flooding the hardware with rapid slider-drag events.
+    """
+    global _rebuild_timer, _pending_voltage, _pending_gain
+
+    def _do_rebuild():
+        with _pending_lock:
+            v = _pending_voltage
+            g = _pending_gain
+        rebuild_configuration_with_params(new_voltage=v, new_gain=g)
+
+    with _pending_lock:
+        if new_voltage is not None:
+            _pending_voltage = new_voltage
+        if new_gain is not None:
+            _pending_gain = new_gain
+
+        # Cancel previous pending timer
+        if _rebuild_timer is not None and _rebuild_timer.is_alive():
+            _rebuild_timer.cancel()
+
+        _rebuild_timer = threading.Timer(delay_s, _do_rebuild)
+        _rebuild_timer.daemon = True
+        _rebuild_timer.start()
+        print(f"[Rebuild] ⏱ Debounce scheduled: voltage={_pending_voltage}V, gain={_pending_gain}dB (fires in {delay_s}s)")
+
+
 def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float = None) -> bool:
     """
     Rebuilds the waveform, TX configs, scans, sequence and full AcquisitionConfiguration
@@ -394,7 +438,14 @@ def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float
     OSTB hardware requires: stop() → configure(new_config) → start() to apply param changes.
     """
     global _global_ostb_runtime, _curv_module
+
+    # Prevent concurrent rebuilds
+    if not _rebuild_lock.acquire(blocking=False):
+        print("[Rebuild] ⚠️ Rebuild already in progress — skipping duplicate request")
+        return False
+
     if _curv_module is None or _global_ostb_runtime is None:
+        _rebuild_lock.release()
         print("[Rebuild] ❌ Cannot rebuild — module or runtime not ready")
         return False
 
@@ -496,9 +547,11 @@ def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float
         # --- Step 6: Restart acquisition ---
         _global_ostb_runtime.start()
         print(f"[Rebuild] ✅ Acquisition restarted — voltage={voltage}V, gain={gain}dB ACTIVE")
+        _rebuild_lock.release()
         return True
 
     except Exception as e:
+        _rebuild_lock.release()
         print(f"[Rebuild] ❌ Error: {e}")
         import traceback
         traceback.print_exc()
@@ -535,21 +588,19 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
             _global_ostb_runtime.stop()
             return True
 
-        # --- Voltage: rebuild full configuration with new voltage & sync patient GUI ---
+        # --- Voltage: debounced rebuild (fires 400ms after last slider change) ---
         elif name == "voltage":
             val = max(0.0, min(50.0, float(value)))
-            print(f"[Direct OSTB API] Setting voltage → {val} V (full rebuild)")
-            res = rebuild_configuration_with_params(new_voltage=val)
-            handle_control_command("voltage", val)
-            return res
+            print(f"[Direct OSTB API] Setting voltage → {val} V (debounced rebuild)")
+            debounced_rebuild_voltage_gain(new_voltage=val)
+            return True
 
-        # --- Analog Gain: rebuild full configuration with new gain & sync patient GUI ---
+        # --- Analog Gain: debounced rebuild (fires 400ms after last slider change) ---
         elif name == "gain":
             val = max(0.0, min(80.0, float(value)))
-            print(f"[Direct OSTB API] Setting analog gain → {val} dB (full rebuild)")
-            res = rebuild_configuration_with_params(new_gain=val)
-            handle_control_command("gain", val)
-            return res
+            print(f"[Direct OSTB API] Setting analog gain → {val} dB (debounced rebuild)")
+            debounced_rebuild_voltage_gain(new_gain=val)
+            return True
 
         # --- Log Compression Gain ---
         elif name == "log_gain":
@@ -621,9 +672,6 @@ def handle_control_command(name: str, value: any) -> bool:
     - Analog Gain Slider: y_pct=0.58
     """
     print(f"[Remote Control API] Processing command: '{name}'={value}")
-
-    # 1. Direct Socket trigger (127.0.0.1:4096)
-    send_ostb_socket_command(name, value)
 
     try:
         import win32gui
