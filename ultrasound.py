@@ -418,6 +418,15 @@ try:
     # the in-process GUI, which would show nothing.
     _orig_start_control_server = ostb.AcquisitionRuntime.start_control_server
     def _hooked_start_control_server(self, *args, **kwargs):
+        # Probe: force a TCP address before starting, to see whether this socket is a
+        # real reachable endpoint or an in-process-only bus (e.g. ZMQ inproc) that just
+        # ignores/rejects this. If a listener shows up on this port afterward, it's real.
+        try:
+            self.set_control_socket_name("tcp://127.0.0.1:6001")
+            print("[ultrasound Hook] Requested control_socket_name = tcp://127.0.0.1:6001")
+        except Exception as e:
+            print(f"[ultrasound Hook] set_control_socket_name('tcp://127.0.0.1:6001') rejected: {e}")
+
         result = _orig_start_control_server(self, *args, **kwargs)
         try:
             name = self.control_socket_name
