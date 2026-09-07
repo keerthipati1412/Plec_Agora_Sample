@@ -63,8 +63,8 @@ if MISSING_MODULES:
   )
 
 # -------------------- USER CONFIG --------------------
-APP_ID = "d05c922c7dfa4997ac64d8e61f83ce08"
-TOKEN = "007eJxTYFCef/HSpGNybPeab/xqn6nUZSToLqGxYvHa5ykVF1p1LuxQYEgxME22NDJKNk9JSzSxtDRPTDYzSbFINTNMszBOTjWw+Os9L6shkJHB93gWMyMDBIL4rAwl+UWlxQwMAMn7IWw="
+APP_ID = "b1d7ee78b8dd4104a2ddd1e904097b3d"
+TOKEN = "007eJxTYLjOrKx5y3HL4jsd5W5fleKrjl0z713zLSjX6eCVOx9MzkUoMCQZppinpppbJFmkpJgYGpgkGqWkpBimWhqYGFiaJxmn/F4xO6shkJHh+KQPjIwMEAjiszKU5BeVFjMwAAAxyiOh"
 CHANNEL = "torus"
 UID = 5001
 
@@ -103,9 +103,14 @@ MQTT_BROKERS = [
     ("broker.emqx.io", 1883),
 ]
 
-# Serializes pause()/configure()/resume() cycles — concurrent MQTT deliveries
-# (e.g. duplicate messages) must never race on the same runtime state machine.
+# Lock to prevent concurrent hardware rebuilds (one at a time)
 _rebuild_lock = threading.Lock()
+# Pending debounce timer for voltage/gain — only apply after slider stops moving
+_pending_rebuild_timer: threading.Timer | None = None
+_pending_rebuild_voltage: float | None = None
+_pending_rebuild_gain: float | None = None
+REBUILD_DEBOUNCE_SECONDS = 0.4  # Wait 400ms after last slider change before rebuilding
+
 
 
 def _start_mqtt_subscriber() -> None:
@@ -133,12 +138,6 @@ def _start_mqtt_subscriber() -> None:
                 payload = json.loads(msg.payload.decode())
                 control = payload.get("control")
                 value = payload.get("value")
-                # Skip voltage/gain/display — patient browser MQTT already delivers
-                # these to /api/remote-input, avoiding double rebuild
-                if control in ("voltage", "gain", "log_gain", "dynamic_range", "display",
-                               "tgc_toggle", "tgc_slider_1", "tgc_slider_2", "tgc_slider_3",
-                               "tgc_slider_4", "tgc_slider_5", "tgc_slider_6"):
-                    return
                 print(f"[MQTT] ✅ Received from {broker_host}: {control} = {value}")
                 if control:
                     execute_direct_runtime_command(control, value)
@@ -173,9 +172,8 @@ def _start_mqtt_subscriber() -> None:
 
 def find_opensonics_control_window() -> int:
     """
-    Finds the OpenSonics / NEXUS Control Panel window handle (hwnd).
-    Matches the window with 'Acquisition' and 'Signal Controls' panels,
-    even when the title bar text is empty or untitled.
+    Finds the NEXUS / OpenSonics Control Panel window handle (hwnd).
+    Explicitly targets window title 'NEXUS' (class 'Qt6102QWindowOwnDCIcon').
     """
     try:
         import win32gui
@@ -184,29 +182,22 @@ def find_opensonics_control_window() -> int:
 
     control_hwnd = [0]
     render_hwnd = [0]
-    all_qt = []
 
     def enum_cb(hwnd, _):
-        if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+        if not win32gui.IsWindow(hwnd):
             return True
-        title = win32gui.GetWindowText(hwnd).strip()
+        title = win32gui.GetWindowText(hwnd)
         cls_name = win32gui.GetClassName(hwnd)
-        rect = win32gui.GetWindowRect(hwnd)
-        w = rect[2] - rect[0]
-        h = rect[3] - rect[1]
 
-        # Match Qt control panel window
-        if "Qt" in cls_name or "QWindow" in cls_name:
-            all_qt.append(f"hwnd={hwnd} title='{title}' class='{cls_name}' size=({w}x{h})")
-            if title == "NEXUS" or title == "OpenSonics" or "Control" in title:
+        # Match exact NEXUS control panel window
+        if title == "NEXUS":
+            control_hwnd[0] = hwnd
+            return False
+        elif "Image" in title or "Focused" in title or "B-Mode" in title:
+            render_hwnd[0] = hwnd
+        elif ("Qt6" in cls_name or "Qt5" in cls_name) and title and title not in ["Launcher", "_q_titlebar"]:
+            if not control_hwnd[0]:
                 control_hwnd[0] = hwnd
-                return False
-            elif "B-Mode" in title or "Focused" in title or "Image" in title:
-                render_hwnd[0] = hwnd
-            elif w >= 350 and h >= 250 and title not in ["Launcher", "_q_titlebar"]:
-                # OpenSonics GUI window often has empty title bar
-                if not control_hwnd[0]:
-                    control_hwnd[0] = hwnd
         return True
 
     try:
@@ -215,13 +206,6 @@ def find_opensonics_control_window() -> int:
         pass
 
     target = control_hwnd[0] or render_hwnd[0] or 0
-    if target:
-        title = win32gui.GetWindowText(target).strip()
-        cls = win32gui.GetClassName(target)
-        rect = win32gui.GetWindowRect(target)
-        print(f"[Remote Control] Selected target window hwnd={target} title='{title}' class='{cls}' rect={rect}")
-    else:
-        print(f"[Remote Control] Warning: Control window not found! Visible Qt windows: {all_qt}")
     return target
 
 
@@ -362,9 +346,6 @@ def _watch_module_runtime() -> None:
             if r is not None:
                 _global_ostb_runtime = r
                 print(f"[ultrasound Watcher] >>> SUCCESS! CAPTURED RUNTIME INSTANCE: {r}")
-                # Print all available methods so we can find direct hardware setters
-                methods = [m for m in dir(r) if not m.startswith("__")]
-                print(f"[ultrasound Watcher] >>> RUNTIME METHODS: {methods}")
                 break
         time.sleep(0.1)
 
@@ -414,63 +395,164 @@ except Exception as exc:
     print(f"[ultrasound Hook] OSTB hook info: {exc}")
 
 
-def _rebuild_configuration(new_voltage: float | None = None, new_gain: float | None = None) -> bool:
+def rebuild_configuration_with_params(new_voltage: float = None, new_gain: float = None) -> bool:
     """
-    AcquisitionRuntime exposes no incremental voltage/gain setter — its only mutation
-    path is configure(full_configuration). But Waveform and Scan instances (not just
-    their Builders) both expose live setters (set_negative_voltage / set_gain_analog),
-    so the already-built objects sitting on the loaded curv_proper_code.py module can be
-    mutated directly — no need to recompute probe geometry or rebuild the sequence from
-    scratch. Still requires stop()->configure()->start() to actually push the change to
-    hardware (confirmed: pause()/resume() don't satisfy configure()'s active-state check).
+    Rebuilds the waveform, TX configs, scans, sequence and full AcquisitionConfiguration
+    from scratch, then reconfigures hardware using stop → configure → start sequence.
+
+    OSTB hardware requires: stop() → configure(new_config) → start() to apply param changes.
+    Uses _rebuild_lock to prevent concurrent rebuilds from multiple rapid slider events.
     """
-    global _curv_module, _global_ostb_runtime
+    global _global_ostb_runtime, _curv_module
     if _curv_module is None or _global_ostb_runtime is None:
-        print(f"[Configure] Module or runtime not ready — cannot set voltage={new_voltage} gain={new_gain}")
+        print("[Rebuild] ❌ Cannot rebuild — module or runtime not ready")
         return False
 
-    m = _curv_module
-    with _rebuild_lock:
+    if not _rebuild_lock.acquire(blocking=False):
+        print("[Rebuild] ⚠️ Another rebuild already in progress — skipping duplicate")
+        return False
+
+    try:
+        import ostb._ostb as ostb_mod
+        import math as _math
+        m = _curv_module  # shorthand
+
+        # Update stored parameters
+        if new_voltage is not None:
+            m._current_voltage = new_voltage
+        if new_gain is not None:
+            m.gain_analog_db = new_gain
+
+        voltage = getattr(m, "_current_voltage", 50.0)
+        gain = getattr(m, "gain_analog_db", 40.0)
+
+        print(f"[Rebuild] ⏳ Starting rebuild: voltage={voltage}V, gain={gain}dB")
+
+        # --- Step 1: Stop acquisition ---
         try:
-            if new_voltage is not None:
-                m.waveform.set_negative_voltage(float(new_voltage))
-                m.waveform.validate()
-
-            if new_gain is not None:
-                gain_val = float(new_gain)
-                for scan in m.seq.scans:
-                    scan.set_gain_analog(gain_val)
-                    scan.validate(m.probe.element_count)
-            else:
-                gain_val = float(m.gain_analog_db)
-
-            m.configuration.validate()
-
-            r = _global_ostb_runtime
-            t0 = time.time()
-            r.stop()
-            print(f"[Configure] stop() took {(time.time() - t0) * 1000:.1f} ms")
-            try:
-                t0 = time.time()
-                r.configure(m.configuration)
-                print(f"[Configure] configure() took {(time.time() - t0) * 1000:.1f} ms "
-                      f"(voltage={new_voltage if new_voltage is not None else 'unchanged'}, gain={gain_val})")
-            finally:
-                t0 = time.time()
-                r.start()
-                print(f"[Configure] start() took {(time.time() - t0) * 1000:.1f} ms")
-
-            if new_voltage is not None:
-                m._current_voltage = float(new_voltage)
-            m.gain_analog_db = gain_val
-            return True
+            _global_ostb_runtime.stop()
+            print("[Rebuild] ✅ Acquisition stopped")
         except Exception as e:
-            print(f"[Configure] Sequence rebuild/configure failed: {e}")
-            return False
+            print(f"[Rebuild] ⚠️ Stop warning (may already be stopped): {e}")
+
+        # --- Step 2: Rebuild waveform with new voltage ---
+        new_waveform = ostb_mod.WaveformFactory.make_unipolar(m.center_frequency_hz)
+        new_waveform.set_awg(False)
+        new_waveform.set_negative_voltage(voltage)
+        new_waveform.validate()
+        print(f"[Rebuild] ✅ Waveform built: voltage={voltage}V")
+
+        # --- Step 3: Rebuild full scan sequence ---
+        new_seq_builder = (ostb_mod.SequenceBuilder()
+                           .set_probe(m.probe)
+                           .set_trigger(m.trigger)
+                           .set_number_of_frames(m.frame_count))
+
+        for line_idx in range(m.line_count):
+            start = line_idx
+            apodization = [0.0] * m.probe.element_count
+            apodization[start: start + m.active_element_count] = [1.0] * m.active_element_count
+
+            center_idx = start + m.active_element_count // 2 - (
+                1 if (m.active_element_count % 2 == 0) else 0
+            )
+
+            azimuth_rad = m.probe.az_angle[center_idx]
+            radius_m = m.probe.radius
+            rho_m = radius_m + m.focus_depth_m
+            x_focus_m = rho_m * _math.sin(azimuth_rad)
+            z_focus_m = -radius_m + rho_m * _math.cos(azimuth_rad)
+
+            tx_config = (ostb_mod.TxConfigBuilder()
+                         .set_apodization(apodization)
+                         .set_source([0.0, 0.0, 0.0])
+                         .set_focus_point([x_focus_m, 0.0, z_focus_m])
+                         .set_tx_with_all_elements(False)
+                         .set_waveform(new_waveform)
+                         .set_speed_of_sound(m.speed_of_sound)
+                         .compute_delays(m.probe)
+                         .build(m.probe))
+
+            scan = (ostb_mod.ScanBuilder()
+                    .set_tx(tx_config)
+                    .set_rx(m.rxConfig)
+                    .set_process_id(0)
+                    .set_scan_id(line_idx)
+                    .set_frame_id(0)
+                    .set_gain_digital(0.0)
+                    .set_gain_analog(gain)
+                    .set_start(m.scan_start_s)
+                    .set_range(m.scan_range_s)
+                    .set_time_slot(m.time_slot_seconds)
+                    .set_sample_factor(m.sample_factor)
+                    .set_compression_type(ostb_mod.CompressionType.DECIMATION)
+                    .set_rectification(ostb_mod.Rectification.SIGNED)
+                    .set_beam_correction(0.0)
+                    .build(m.probe.element_count))
+
+            new_seq_builder.add_scan(scan)
+
+        new_seq = new_seq_builder.build()
+        print(f"[Rebuild] ✅ Sequence built: {m.line_count} scan lines")
+
+        # --- Step 4: Rebuild AcquisitionConfiguration ---
+        new_config = ostb_mod.AcquisitionConfiguration()
+        new_config.set_root(m.root)
+        new_config.set_sequence(new_seq)
+        new_config.set_processing(m.processing)
+        new_config.validate()
+        print("[Rebuild] ✅ Configuration validated")
+
+        # --- Step 5: Configure hardware ---
+        _global_ostb_runtime.configure(new_config)
+        print(f"[Rebuild] ✅ Hardware configured: voltage={voltage}V, gain={gain}dB")
+
+        # --- Step 6: Restart acquisition ---
+        _global_ostb_runtime.start()
+        print(f"[Rebuild] ✅ Acquisition restarted — voltage={voltage}V, gain={gain}dB ACTIVE")
+        return True
+
+    except Exception as e:
+        print(f"[Rebuild] ❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+    finally:
+        _rebuild_lock.release()
 
 
+def schedule_rebuild(new_voltage: float = None, new_gain: float = None) -> None:
+    """
+    Debounced rebuild — waits REBUILD_DEBOUNCE_SECONDS after the LAST slider change
+    before actually rebuilding hardware. This prevents 20+ rebuilds when the user
+    drags a slider quickly, reducing lag dramatically.
+    """
+    global _pending_rebuild_timer, _pending_rebuild_voltage, _pending_rebuild_gain
 
+    # Update the pending values with the latest slider position
+    if new_voltage is not None:
+        _pending_rebuild_voltage = new_voltage
+    if new_gain is not None:
+        _pending_rebuild_gain = new_gain
 
+    # Cancel any existing timer (slider is still moving)
+    if _pending_rebuild_timer is not None:
+        _pending_rebuild_timer.cancel()
+
+    # Start a new timer — fires only if slider stops moving for REBUILD_DEBOUNCE_SECONDS
+    def _do_rebuild():
+        global _pending_rebuild_voltage, _pending_rebuild_gain
+        v = _pending_rebuild_voltage
+        g = _pending_rebuild_gain
+        _pending_rebuild_voltage = None
+        _pending_rebuild_gain = None
+        print(f"[Debounce] Applying deferred rebuild: voltage={v}V, gain={g}dB")
+        rebuild_configuration_with_params(new_voltage=v, new_gain=g)
+
+    _pending_rebuild_timer = threading.Timer(REBUILD_DEBOUNCE_SECONDS, _do_rebuild)
+    _pending_rebuild_timer.daemon = True
+    _pending_rebuild_timer.start()
 
 
 def execute_direct_runtime_command(name: str, value: any) -> bool:
@@ -502,23 +584,19 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
             _global_ostb_runtime.stop()
             return True
 
-        # --- Voltage: rebuild sequence with new voltage baked in, push via configure() ---
+        # --- Voltage: debounced rebuild (waits for slider to stop before applying) ---
         elif name == "voltage":
-            val = float(value)
-            print(f"[Direct OSTB API] Setting voltage -> {val} V")
-            applied = _rebuild_configuration(new_voltage=val)
-            if not applied:
-                print(f"[Direct OSTB API] ⚠️ Failed to apply voltage={val} via configure().")
-            return applied
+            val = max(0.0, min(50.0, float(value)))
+            print(f"[Direct OSTB API] Queuing voltage → {val} V (debounced rebuild)")
+            schedule_rebuild(new_voltage=val)
+            return True
 
-        # --- Analog Gain: rebuild sequence with new gain baked in, push via configure() ---
+        # --- Analog Gain: debounced rebuild ---
         elif name == "gain":
-            val = float(value)
-            print(f"[Direct OSTB API] Setting analog gain -> {val} dB")
-            applied = _rebuild_configuration(new_gain=val)
-            if not applied:
-                print(f"[Direct OSTB API] ⚠️ Failed to apply gain={val} via configure().")
-            return applied
+            val = max(0.0, min(80.0, float(value)))
+            print(f"[Direct OSTB API] Queuing gain → {val} dB (debounced rebuild)")
+            schedule_rebuild(new_gain=val)
+            return True
 
         # --- Log Compression Gain ---
         elif name == "log_gain":
@@ -559,127 +637,39 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
     return handle_control_command(name, value)
 
 
-def send_hardware_click_to_slider(hwnd: int, cx: int, cy: int) -> bool:
+def send_direct_qt_click(hwnd: int, cx: int, cy: int) -> None:
     """
-    Inject a REAL hardware-level mouse click using SendInput.
-
-    Why SendInput and not SendMessage/PostMessage:
-    - SendMessage/PostMessage inject synthetic Win32 messages that Qt's native event
-      filter (QAbstractNativeEventFilter) may ignore or deprioritize.
-    - SendInput injects into the OS raw input stream — identical to a physical mouse click.
-    - This is the ONLY method guaranteed to trigger Qt QSlider's valueChanged() signal
-      which then calls pOEMPA->SetGainAnalog / SetVoltage in the hardware driver.
-
-    The window is briefly moved to (0,0) and brought to foreground so the click lands
-    on-screen, then restored within ~150ms.
+    Sends direct Win32 WM_LBUTTONDOWN and WM_LBUTTONUP messages directly to Qt's event queue.
+    Does NOT move the physical cursor or blink the mouse pointer on screen.
     """
-    import ctypes
-    import ctypes.wintypes
     import win32gui
     import win32con
     import win32api
 
-    # SendInput structures
-    MOUSEEVENTF_MOVE      = 0x0001
-    MOUSEEVENTF_LEFTDOWN  = 0x0002
-    MOUSEEVENTF_LEFTUP    = 0x0004
-    MOUSEEVENTF_ABSOLUTE  = 0x8000
-    INPUT_MOUSE           = 0
-
-    class MOUSEINPUT(ctypes.Structure):
-        _fields_ = [
-            ("dx",          ctypes.c_long),
-            ("dy",          ctypes.c_long),
-            ("mouseData",   ctypes.c_ulong),
-            ("dwFlags",     ctypes.c_ulong),
-            ("time",        ctypes.c_ulong),
-            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-        ]
-
-    class _INPUT_UNION(ctypes.Union):
-        _fields_ = [("mi", MOUSEINPUT)]
-
-    class INPUT(ctypes.Structure):
-        _fields_ = [("type", ctypes.c_ulong), ("_input", _INPUT_UNION)]
-
-    def make_mouse_input(flags, dx=0, dy=0):
-        inp = INPUT()
-        inp.type = INPUT_MOUSE
-        inp.mi.dx = dx
-        inp.mi.dy = dy
-        inp.mi.mouseData = 0
-        inp.mi.dwFlags = flags
-        inp.mi.time = 0
-        inp.mi.dwExtraInfo = ctypes.pointer(ctypes.c_ulong(0))
-        return inp
-
     try:
-        # --- Save state ---
-        orig_cursor  = win32api.GetCursorPos()
-        orig_rect    = win32gui.GetWindowRect(hwnd)
-        orig_place   = win32gui.GetWindowPlacement(hwnd)
-        win_w = orig_rect[2] - orig_rect[0]
-        win_h = orig_rect[3] - orig_rect[1]
-
-        # --- Move window to (0,0) and bring to foreground ---
-        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, win_w, win_h,
-                              win32con.SWP_SHOWWINDOW)
-        ctypes.windll.user32.SetForegroundWindow(hwnd)
-        time.sleep(0.06)  # wait for OS to grant foreground
-
-        # Target screen coord = (cx, cy) because window is now at (0,0)
-        screen_x = int(cx)
-        screen_y = int(cy)
-
-        # Normalise to 65535-range for ABSOLUTE mode
-        screen_w = ctypes.windll.user32.GetSystemMetrics(0)  # SM_CXSCREEN
-        screen_h = ctypes.windll.user32.GetSystemMetrics(1)  # SM_CYSCREEN
-        norm_x = int(screen_x * 65535 / screen_w)
-        norm_y = int(screen_y * 65535 / screen_h)
-
-        # --- Move cursor to target ---
-        win32api.SetCursorPos((screen_x, screen_y))
-        time.sleep(0.02)
-
-        # --- Fire LBUTTONDOWN then LBUTTONUP via SendInput ---
-        inputs = (INPUT * 2)(
-            make_mouse_input(MOUSEEVENTF_LEFTDOWN),
-            make_mouse_input(MOUSEEVENTF_LEFTUP),
-        )
-        sent = ctypes.windll.user32.SendInput(2, inputs, ctypes.sizeof(INPUT))
+        lParam = win32api.MAKELONG(int(cx), int(cy))
+        print(f"[Remote Control Qt] Posting WM_LBUTTONDOWN/UP to hwnd={hwnd} at client ({cx}, {cy})")
+        win32gui.PostMessage(hwnd, win32con.WM_ACTIVATE, win32con.WA_ACTIVE, 0)
+        win32gui.PostMessage(hwnd, win32con.WM_MOUSEMOVE, 0, lParam)
+        win32gui.PostMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lParam)
         time.sleep(0.04)
-
-        print(f"[Remote Control] SendInput hardware click at screen ({screen_x},{screen_y}), sent={sent}")
-
-        # --- Restore window and cursor ---
-        time.sleep(0.03)
-        win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST,
-                              orig_rect[0], orig_rect[1], win_w, win_h,
-                              win32con.SWP_SHOWWINDOW)
-        if orig_place[1] == win32con.SW_SHOWMINIMIZED:
-            win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
-        win32api.SetCursorPos(orig_cursor)
-        return True
-
+        win32gui.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, lParam)
     except Exception as e:
-        print(f"[Remote Control] SendInput error: {e}")
-        return False
+        print(f"[Remote Control Qt] PostMessage error: {e}")
 
 
 def handle_control_command(name: str, value: any) -> bool:
     """
-    Handles control commands from doctor side and delivers them directly into the
-    OpenSonics Control Panel window via PostMessage.
-    Calibrated exactly to the OpenSonics Acquisition & Signal Controls layout:
-    - Stop Button: x_pct=0.245, y_pct=0.288
-    - Freeze Button: x_pct=0.245, y_pct=0.390
-    - Voltage Slider: track spans x=0.078 to 0.420, y_pct=0.564
-    - Analog Gain Slider: track spans x=0.078 to 0.420, y_pct=0.703
-    - Display Toggle: x_pct=0.650, y_pct=0.765
-    - TGC Toggle: x_pct=0.650, y_pct=0.262
+    Handles control commands from doctor side and delivers them directly into NEXUS via PostMessage & PySonics socket.
+    Coordinates calibrated to NEXUS window layout (640x480 ratio):
+    - Start Button: x_pct=0.25, y_pct=0.16 (cy=68)
+    - Freeze Button: x_pct=0.25, y_pct=0.25 (cy=108)
+    - Voltage Slider: y_pct=0.42
+    - Analog Gain Slider: y_pct=0.58
     """
     print(f"[Remote Control API] Processing command: '{name}'={value}")
+
+    # Socket command removed — handled via direct OSTB runtime API above
 
     try:
         import win32gui
@@ -694,78 +684,70 @@ def handle_control_command(name: str, value: any) -> bool:
         return True
 
     rect = win32gui.GetWindowRect(hwnd)
-    win_left, win_top, win_right, win_bottom = rect
-    win_w = max(400, win_right - win_left)
-    win_h = max(300, win_bottom - win_top)
+    left, top, right, bottom = rect
+    width = max(500, right - left)
+    height = max(380, bottom - top)
 
     x_pct = None
     y_pct = None
 
     if name == "start":
-        # Stop / Start button (blue button in Acquisition panel)
-        x_pct, y_pct = 0.245, 0.288
+        x_pct, y_pct = 0.25, 0.16
+        # Send Space/Enter keypresses directly into Qt window
         try:
             win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_SPACE, 0)
-            time.sleep(0.02)
+            time.sleep(0.03)
             win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_SPACE, 0)
+            win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
+            time.sleep(0.03)
+            win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
         except Exception:
             pass
 
     elif name == "freeze":
-        # Freeze button (white button with snowflake in Acquisition panel)
-        x_pct, y_pct = 0.245, 0.390
+        x_pct, y_pct = 0.25, 0.25
         try:
             win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_SPACE, 0)
-            time.sleep(0.02)
+            time.sleep(0.03)
             win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_SPACE, 0)
         except Exception:
             pass
-
     elif name == "voltage":
         val = float(value)
-        # Track spans from x=0.078 to x=0.420; center y=0.564
-        max_v = 50.0
-        pct = max(0.0, min(1.0, val / max_v))
-        x_pct = 0.078 + pct * (0.420 - 0.078)
-        y_pct = 0.564
-
+        x_pct = 0.12 + (val / 50.0) * 0.26
+        y_pct = 0.42
     elif name == "gain":
         val = float(value)
-        # Track spans from x=0.078 to x=0.420; center y=0.703
-        max_g = 40.0
-        pct = max(0.0, min(1.0, val / max_g))
-        x_pct = 0.078 + pct * (0.420 - 0.078)
-        y_pct = 0.703
-
+        x_pct = 0.12 + (val / 40.0) * 0.26
+        y_pct = 0.58
     elif name == "display":
-        # Display toggle switch
-        x_pct, y_pct = 0.650, 0.765
-
+        x_pct, y_pct = 0.64, 0.70
     elif name == "tgc_toggle":
-        # TGC toggle switch
-        x_pct, y_pct = 0.650, 0.262
-
+        x_pct, y_pct = 0.64, 0.18
     elif name.startswith("tgc_slider_"):
         try:
             slider_idx = int(name.split("_")[-1]) - 1
             val = float(value)
-            # 6 TGC vertical sliders span x=0.56 to x=0.94; y spans 0.36 to 0.68
-            x_pct = 0.56 + (slider_idx * 0.076)
-            y_pct = 0.68 - (val / 100.0) * 0.32
+            x_pct = 0.54 + (slider_idx * 0.07)
+            y_pct = 0.62 - (val / 100.0) * 0.34
         except ValueError:
             return False
-
     elif name == "save_setup":
-        x_pct, y_pct = 0.63, 0.88
+        x_pct, y_pct = 0.62, 0.83
     elif name == "advanced":
-        x_pct, y_pct = 0.85, 0.88
+        x_pct, y_pct = 0.84, 0.83
 
     if x_pct is not None and y_pct is not None:
-        # cx, cy = client coordinates (window assumed at (0,0) during click)
-        cx = int(x_pct * win_w)
-        cy = int(y_pct * win_h)
-        print(f"[Remote Control] Injecting hardware click '{name}'={value} at ({x_pct:.3f},{y_pct:.3f}) -> client ({cx},{cy})")
-        send_hardware_click_to_slider(hwnd, cx, cy)
+        cx = int(x_pct * width)
+        cy = int(y_pct * height)
+        
+        # Deliver mouse click directly into Qt event queue (No mouse blinking!)
+        send_direct_qt_click(hwnd, cx, cy)
+        
+        # Also backup hardware click if window is currently visible
+        if left >= 0 and top >= 0:
+            send_win32_click(hwnd, cx, cy)
+
         return True
 
     return True
@@ -1093,44 +1075,19 @@ def add_cors_headers(response):
 @app.route("/api/status", methods=["GET"])
 def get_status():
     """
-    Returns current control panel state directly from curv_proper_code.py parameters and hardware.
-    Allows Doctor UI on load to sync sliders and buttons to patient hardware state dynamically.
+    Returns current control panel state directly from curv_proper_code.py parameters.
+    Allows Doctor UI on load to sync sliders and buttons to patient hardware state.
     """
-    global _curv_module, _global_ostb_runtime
-    voltage_val = 50.0
-    voltage_max = 50.0
-    gain_val = 40.0
-    gain_max = 40.0
-    log_gain_val = 50.0
-    dyn_range_val = 60.0
-
-    if _curv_module is not None:
+    global _curv_module
+    if _curv_module is not None and hasattr(_curv_module, "get_current_status"):
         try:
-            if hasattr(_curv_module, "gain_analog_db"):
-                gain_val = float(_curv_module.gain_analog_db)
-                gain_max = max(40.0, gain_val)
-            if hasattr(_curv_module, "_current_voltage"):
-                voltage_val = float(_curv_module._current_voltage)
-                voltage_max = max(50.0, voltage_val)
-            elif hasattr(_curv_module, "waveform"):
-                voltage_val = 50.0
-                voltage_max = 50.0
-            if hasattr(_curv_module, "log"):
-                log_gain_val = float(getattr(_curv_module.log, "gain_db", 50.0))
-                dyn_range_val = float(getattr(_curv_module.log, "dynamic_range_db", 60.0))
+            return jsonify(_curv_module.get_current_status())
         except Exception as e:
-            print(f"[Status API] Error reading parameters from module: {e}")
-
+            print(f"[Status API] Error getting status: {e}")
     return jsonify({
-        "status": "RUNNING" if (_global_ostb_runtime is not None) else "STOPPED",
-        "voltage": voltage_val,
-        "voltage_min": 0.0,
-        "voltage_max": voltage_max,
-        "gain": gain_val,
-        "gain_min": 0.0,
-        "gain_max": gain_max,
-        "log_gain": log_gain_val,
-        "dynamic_range": dyn_range_val,
+        "status": "STOPPED",
+        "voltage": 50.0,
+        "gain": 40.0,
         "display": True,
         "tgc_enabled": False,
         "tgc_sliders": [50, 12, 3, 77, 90, 30]
@@ -1236,18 +1193,6 @@ def publisher_page():
               }} else {{
                 console.log(`[Patient MQTT] Subscribed to control topic: ${{topic}}`);
                 setStatus(`Ultrasound active (Remote Control connected on channel: ${{CHANNEL}})`);
-
-                // Broadcast hardware limits and current parameters to Doctor
-                fetch(window.location.origin + "/api/status")
-                  .then(r => r.json())
-                  .then(data => {{
-                    console.log("[Patient MQTT] Broadcasting hardware limits to Doctor:", data);
-                    mqttClient.publish(topic + "-status", JSON.stringify({{
-                      type: "hardware_limits",
-                      data: data
-                    }}));
-                  }})
-                  .catch(e => console.warn("[Patient MQTT] Could not fetch status for broadcast:", e));
               }}
             }});
           }});
