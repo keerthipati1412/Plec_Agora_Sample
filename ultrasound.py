@@ -561,35 +561,72 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
 
 def send_direct_qt_click(hwnd: int, cx: int, cy: int) -> None:
     """
-    Sends direct Win32 WM_LBUTTONDOWN, MOUSEMOVE, and WM_LBUTTONUP messages directly to Qt's event queue.
-    Dispatches to both top-level window and child control under coordinates.
-    Does NOT move the physical cursor or blink the mouse pointer on screen.
+    Delivers a mouse click to a Qt slider widget so Qt's valueChanged() signal fires
+    and the hardware driver (pOEMPA->SetGainAnalog / SetVoltage) is actually called.
+
+    KEY INSIGHT: PostMessage is asynchronous and Qt sliders require the window to be
+    in the foreground with focus. We use SendMessage (synchronous) after activating
+    the window so the full Qt event chain runs: MousePress -> valueChanged -> hardware.
+
+    To avoid flashing the window on screen we restore it to its original position
+    immediately after the click.
     """
     import win32gui
     import win32con
     import win32api
+    import ctypes
 
     try:
         lParam = win32api.MAKELONG(int(cx), int(cy))
 
-        # Check for child control under coordinates
+        # --- Find the actual child QSlider widget under the click point ---
+        # Qt QSlider is typically a child window; we want to target it directly.
         child = win32gui.RealChildWindowFromPoint(hwnd, (int(cx), int(cy)))
-        targets = [hwnd]
-        if child and child != hwnd:
-            targets.append(child)
+        target = child if (child and child != hwnd) else hwnd
 
-        for target in targets:
-            win32gui.PostMessage(target, win32con.WM_ACTIVATE, win32con.WA_ACTIVE, 0)
-            win32gui.PostMessage(target, win32con.WM_MOUSEMOVE, 0, lParam)
-            win32gui.PostMessage(target, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lParam)
-            time.sleep(0.01)
-            win32gui.PostMessage(target, win32con.WM_MOUSEMOVE, win32con.MK_LBUTTON, lParam)
-            time.sleep(0.01)
-            win32gui.PostMessage(target, win32con.WM_LBUTTONUP, 0, lParam)
+        # --- Save current window state ---
+        orig_rect = win32gui.GetWindowRect(hwnd)
+        orig_placement = win32gui.GetWindowPlacement(hwnd)
 
-        print(f"[Remote Control Qt] Dispatched mouse click-drag to {len(targets)} targets at client ({cx}, {cy})")
+        # --- Bring window to foreground (required for Qt to process input correctly) ---
+        # Move to (0,0) so our click coordinates are on-screen
+        win_w = orig_rect[2] - orig_rect[0]
+        win_h = orig_rect[3] - orig_rect[1]
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, win_w, win_h,
+                              win32con.SWP_SHOWWINDOW)
+        try:
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        time.sleep(0.04)  # Allow window to render in foreground
+
+        # --- Use SendMessage (synchronous) so Qt's event loop processes immediately ---
+        import ctypes.wintypes
+        WM_LBUTTONDOWN = 0x0201
+        WM_LBUTTONUP   = 0x0202
+        WM_MOUSEMOVE   = 0x0200
+        MK_LBUTTON     = 0x0001
+
+        ctypes.windll.user32.SendMessageW(target, WM_MOUSEMOVE, 0, lParam)
+        ctypes.windll.user32.SendMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, lParam)
+        time.sleep(0.02)
+        ctypes.windll.user32.SendMessageW(target, WM_MOUSEMOVE, MK_LBUTTON, lParam)
+        time.sleep(0.02)
+        ctypes.windll.user32.SendMessageW(target, WM_LBUTTONUP, 0, lParam)
+
+        print(f"[Remote Control Qt] SendMessage click sent to hwnd={target} at client ({cx},{cy})")
+
+        # --- Restore window to original position/state ---
+        time.sleep(0.05)
+        win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST,
+                              orig_rect[0], orig_rect[1], win_w, win_h,
+                              win32con.SWP_SHOWWINDOW)
+        if orig_placement[1] == win32con.SW_SHOWMINIMIZED:
+            win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+
     except Exception as e:
-        print(f"[Remote Control Qt] PostMessage error: {e}")
+        print(f"[Remote Control Qt] SendMessage error: {e}")
 
 
 def handle_control_command(name: str, value: any) -> bool:
