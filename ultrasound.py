@@ -559,74 +559,112 @@ def execute_direct_runtime_command(name: str, value: any) -> bool:
     return handle_control_command(name, value)
 
 
-def send_direct_qt_click(hwnd: int, cx: int, cy: int) -> None:
+def send_hardware_click_to_slider(hwnd: int, cx: int, cy: int) -> bool:
     """
-    Delivers a mouse click to a Qt slider widget so Qt's valueChanged() signal fires
-    and the hardware driver (pOEMPA->SetGainAnalog / SetVoltage) is actually called.
+    Inject a REAL hardware-level mouse click using SendInput.
 
-    KEY INSIGHT: PostMessage is asynchronous and Qt sliders require the window to be
-    in the foreground with focus. We use SendMessage (synchronous) after activating
-    the window so the full Qt event chain runs: MousePress -> valueChanged -> hardware.
+    Why SendInput and not SendMessage/PostMessage:
+    - SendMessage/PostMessage inject synthetic Win32 messages that Qt's native event
+      filter (QAbstractNativeEventFilter) may ignore or deprioritize.
+    - SendInput injects into the OS raw input stream — identical to a physical mouse click.
+    - This is the ONLY method guaranteed to trigger Qt QSlider's valueChanged() signal
+      which then calls pOEMPA->SetGainAnalog / SetVoltage in the hardware driver.
 
-    To avoid flashing the window on screen we restore it to its original position
-    immediately after the click.
+    The window is briefly moved to (0,0) and brought to foreground so the click lands
+    on-screen, then restored within ~150ms.
     """
+    import ctypes
+    import ctypes.wintypes
     import win32gui
     import win32con
     import win32api
-    import ctypes
+
+    # SendInput structures
+    MOUSEEVENTF_MOVE      = 0x0001
+    MOUSEEVENTF_LEFTDOWN  = 0x0002
+    MOUSEEVENTF_LEFTUP    = 0x0004
+    MOUSEEVENTF_ABSOLUTE  = 0x8000
+    INPUT_MOUSE           = 0
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx",          ctypes.c_long),
+            ("dy",          ctypes.c_long),
+            ("mouseData",   ctypes.c_ulong),
+            ("dwFlags",     ctypes.c_ulong),
+            ("time",        ctypes.c_ulong),
+            ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+        ]
+
+    class _INPUT_UNION(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_ulong), ("_input", _INPUT_UNION)]
+
+    def make_mouse_input(flags, dx=0, dy=0):
+        inp = INPUT()
+        inp.type = INPUT_MOUSE
+        inp.mi.dx = dx
+        inp.mi.dy = dy
+        inp.mi.mouseData = 0
+        inp.mi.dwFlags = flags
+        inp.mi.time = 0
+        inp.mi.dwExtraInfo = ctypes.pointer(ctypes.c_ulong(0))
+        return inp
 
     try:
-        lParam = win32api.MAKELONG(int(cx), int(cy))
-
-        # --- Find the actual child QSlider widget under the click point ---
-        # Qt QSlider is typically a child window; we want to target it directly.
-        child = win32gui.RealChildWindowFromPoint(hwnd, (int(cx), int(cy)))
-        target = child if (child and child != hwnd) else hwnd
-
-        # --- Save current window state ---
-        orig_rect = win32gui.GetWindowRect(hwnd)
-        orig_placement = win32gui.GetWindowPlacement(hwnd)
-
-        # --- Bring window to foreground (required for Qt to process input correctly) ---
-        # Move to (0,0) so our click coordinates are on-screen
+        # --- Save state ---
+        orig_cursor  = win32api.GetCursorPos()
+        orig_rect    = win32gui.GetWindowRect(hwnd)
+        orig_place   = win32gui.GetWindowPlacement(hwnd)
         win_w = orig_rect[2] - orig_rect[0]
         win_h = orig_rect[3] - orig_rect[1]
+
+        # --- Move window to (0,0) and bring to foreground ---
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, win_w, win_h,
                               win32con.SWP_SHOWWINDOW)
-        try:
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
-        time.sleep(0.04)  # Allow window to render in foreground
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        time.sleep(0.06)  # wait for OS to grant foreground
 
-        # --- Use SendMessage (synchronous) so Qt's event loop processes immediately ---
-        import ctypes.wintypes
-        WM_LBUTTONDOWN = 0x0201
-        WM_LBUTTONUP   = 0x0202
-        WM_MOUSEMOVE   = 0x0200
-        MK_LBUTTON     = 0x0001
+        # Target screen coord = (cx, cy) because window is now at (0,0)
+        screen_x = int(cx)
+        screen_y = int(cy)
 
-        ctypes.windll.user32.SendMessageW(target, WM_MOUSEMOVE, 0, lParam)
-        ctypes.windll.user32.SendMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, lParam)
+        # Normalise to 65535-range for ABSOLUTE mode
+        screen_w = ctypes.windll.user32.GetSystemMetrics(0)  # SM_CXSCREEN
+        screen_h = ctypes.windll.user32.GetSystemMetrics(1)  # SM_CYSCREEN
+        norm_x = int(screen_x * 65535 / screen_w)
+        norm_y = int(screen_y * 65535 / screen_h)
+
+        # --- Move cursor to target ---
+        win32api.SetCursorPos((screen_x, screen_y))
         time.sleep(0.02)
-        ctypes.windll.user32.SendMessageW(target, WM_MOUSEMOVE, MK_LBUTTON, lParam)
-        time.sleep(0.02)
-        ctypes.windll.user32.SendMessageW(target, WM_LBUTTONUP, 0, lParam)
 
-        print(f"[Remote Control Qt] SendMessage click sent to hwnd={target} at client ({cx},{cy})")
+        # --- Fire LBUTTONDOWN then LBUTTONUP via SendInput ---
+        inputs = (INPUT * 2)(
+            make_mouse_input(MOUSEEVENTF_LEFTDOWN),
+            make_mouse_input(MOUSEEVENTF_LEFTUP),
+        )
+        sent = ctypes.windll.user32.SendInput(2, inputs, ctypes.sizeof(INPUT))
+        time.sleep(0.04)
 
-        # --- Restore window to original position/state ---
-        time.sleep(0.05)
+        print(f"[Remote Control] SendInput hardware click at screen ({screen_x},{screen_y}), sent={sent}")
+
+        # --- Restore window and cursor ---
+        time.sleep(0.03)
         win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST,
                               orig_rect[0], orig_rect[1], win_w, win_h,
                               win32con.SWP_SHOWWINDOW)
-        if orig_placement[1] == win32con.SW_SHOWMINIMIZED:
+        if orig_place[1] == win32con.SW_SHOWMINIMIZED:
             win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+        win32api.SetCursorPos(orig_cursor)
+        return True
 
     except Exception as e:
-        print(f"[Remote Control Qt] SendMessage error: {e}")
+        print(f"[Remote Control] SendInput error: {e}")
+        return False
 
 
 def handle_control_command(name: str, value: any) -> bool:
@@ -723,13 +761,11 @@ def handle_control_command(name: str, value: any) -> bool:
         x_pct, y_pct = 0.85, 0.88
 
     if x_pct is not None and y_pct is not None:
-        screen_x = win_left + int(x_pct * win_w)
-        screen_y = win_top + int(y_pct * win_h)
-        cx, cy = win32gui.ScreenToClient(hwnd, (screen_x, screen_y))
-        
-        # Deliver mouse click directly into Qt event queue (100% background, no mouse blinking, 0ms lag!)
-        send_direct_qt_click(hwnd, cx, cy)
-        print(f"[Remote Control] Clicked '{name}' at ({x_pct:.3f}, {y_pct:.3f}) -> client ({cx}, {cy})")
+        # cx, cy = client coordinates (window assumed at (0,0) during click)
+        cx = int(x_pct * win_w)
+        cy = int(y_pct * win_h)
+        print(f"[Remote Control] Injecting hardware click '{name}'={value} at ({x_pct:.3f},{y_pct:.3f}) -> client ({cx},{cy})")
+        send_hardware_click_to_slider(hwnd, cx, cy)
         return True
 
     return True
